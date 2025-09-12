@@ -4,11 +4,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # --- YOLOv5 internals ---
 from models.common import DetectMultiBackend
 from utils.dataloaders import LoadImages
-from utils.general import non_max_suppression, scale_boxes, check_img_size, LOGGER
+from utils.general import non_max_suppression, scale_boxes, check_img_size, LOGGER, increment_path
 from utils.torch_utils import select_device
 
 def expand_and_clamp(x1,y1,x2,y2,W,H,pad_frac):
@@ -32,12 +35,12 @@ def resize_keep_height(img, target_h):
 
 def run_stage_a_detect_and_crop(args):
     out_root = Path(args.outdir)
-    crops_dir = out_root / "crops"
-    crops_dir.mkdir(parents=True, exist_ok=True)
-    manifest_fp = out_root / "manifest.jsonl"
+    # crops/expN
+    crops_dir = increment_path(out_root / "crops/exp", mkdir=True)
+    manifest_fp = crops_dir / f"manifest_{crops_dir.name}.jsonl"
     mf = open(manifest_fp, "w")
 
-    # Load vial model (THIS is where weights are invoked)
+    # Load vial model
     device = select_device(args.device)
     vial_model = DetectMultiBackend(args.vial_weights, device=device, dnn=False, data=None, fp16=args.half)
     stride, names, pt = vial_model.stride, vial_model.names, vial_model.pt
@@ -112,8 +115,9 @@ def run_stage_b_liquid(args, crops_dir):
             "--iou-thres", str(args.liquid_iou),
             "--save-txt", "--save-conf",
             "--project", out_dir,
-            "--name", "exp",
-            "--exist-ok"
+            "--line-thickness", "1",
+            # "--name", "exp",
+            # "--exist-ok"
         ]
     elif args.liquid_task == "segment":
         # Uses YOLOv5 seg pipeline
@@ -143,11 +147,17 @@ STABLE_ID = 1
 AIR_ID = 2
 LIQUID_CLASSES = {STABLE_ID, GEL_ID}
 
-# Heuristics (have to tune on labeled crops)
+# Heuristics
 PHASE_LAYER_MIN_GAP = 0.06   # min vertical gap between layer centers (normalized to crop height)
 IOU_MERGE_THR       = 0.50   # merge almost identical boxes
 STEP_THR            = 22.0   # vertical intensity step backup trigger
-GEL_AREA_FRAC_THR   = 0.35   # gel area fraction to classify as gelled
+GEL_AREA_FRAC_THR   = 0.35   # gel area fraction to classify as gelled; if gel area >=  of liquid area => gel
+CONF_MIN              = 0.20   # ignore boxes below this conf
+GEL_DOMINANCE_COUNT_THR = 1    # OR if (#gel boxes - #stable boxes) >= 1 => gel
+AIR_GAP_THR = 0.08  # % of crop height
+
+def is_liquid_cls(cid: int) -> bool:
+    return cid in (GEL_ID, STABLE_ID)
 
 def yolo_line_to_xyxy(line, W, H):
     # "cls cx cy w h [conf]"
@@ -162,21 +172,6 @@ def yolo_line_to_xyxy(line, W, H):
     return cls, [x1,y1,x2,y2], conf
 
 def box_area(b):
-    x1,y1,x2,y2 = b
-    return max(0, x2-x1) * max(0, y2-y1)
-
-def _yolo_line_to_box(line, W, H):
-    # "cls cx cy w h [conf]"
-    parts = line.strip().split()
-    if len(parts) < 5: return None
-    cid = int(parts[0])
-    cx, cy, w, h = map(float, parts[1:5])
-    conf = float(parts[5]) if len(parts) >= 6 else 1.0
-    x1 = (cx - w/2) * W; y1 = (cy - h/2) * H
-    x2 = (cx + w/2) * W; y2 = (cy + h/2) * H
-    return cid, (x1,y1,x2,y2), conf
-
-def _area(b):
     x1,y1,x2,y2 = b
     return max(0, x2-x1) * max(0, y2-y1)
 
@@ -252,7 +247,7 @@ def decide_state_from_boxes(crop_path, label_path, cls_map=(AIR_ID, STABLE_ID, G
             if cls in LIQUID_CLASSES:
                 liquid_boxes.append(box)
                 total_liquid_area += box_area(box)
-                if cls == GEL_CLS:
+                if cls == GEL_ID:
                     gel_boxes.append(box)
                     gel_area += box_area(box)
 
@@ -282,13 +277,13 @@ def decide_state_from_boxes(crop_path, label_path, cls_map=(AIR_ID, STABLE_ID, G
         "step": float(step)
     }
 
-# Tuning
-CONF_MIN              = 0.20   # ignore boxes below this conf
-GEL_AREA_FRAC_THR     = 0.35   # if gel area >=  of liquid area => gel
-GEL_DOMINANCE_COUNT_THR = 1    # OR if (#gel boxes - #stable boxes) >= 1 => gel
+def infer_air_present(liquid_boxes_px, H):
+    if not liquid_boxes_px:
+        return True  # no liquid boxes => air-only
+    top_y = min(b[1] for b in liquid_boxes_px)
+    return (top_y / float(H)) >= AIR_GAP_THR
 
 def decide_air_stable_gel_from_labels(crop_path: Path, label_path: Path):
-    """Return {'vial_state': 'air'|'stable'|'gel', ...}."""
     img = cv2.imread(str(crop_path))
     if img is None:
         return {"vial_state": "air", "reason": "crop_not_found"}
@@ -298,9 +293,10 @@ def decide_air_stable_gel_from_labels(crop_path: Path, label_path: Path):
         return {"vial_state": "air", "reason": "no_label_file"}
 
     liquid_area = 0.0
-    gel_area    = 0.0
+    gel_area = 0.0
     n_stable = 0
-    n_gel    = 0
+    n_gel = 0
+    liquid_boxes_px = []
 
     with open(label_path) as f:
         for raw in f:
@@ -313,34 +309,52 @@ def decide_air_stable_gel_from_labels(crop_path: Path, label_path: Path):
             cid, box, conf = parsed
             if conf < CONF_MIN:
                 continue
-            if cid == AIR_ID:
-                continue  # ignore air for state
-            a = box_area(box)
-            liquid_area += a
-            if cid == GEL_ID:
-                gel_area += a
-                n_gel += 1
-            elif cid == STABLE_ID:
-                n_stable += 1
-            else:
-                # unknown class -> ignore
-                pass
+
+            if is_liquid_cls(cid):
+                liquid_boxes_px.append(box)
+                a = box_area(box)
+                liquid_area += a
+                if cid == GEL_ID:
+                    gel_area += a
+                    n_gel += 1
+                elif cid == STABLE_ID:
+                    n_stable += 1
+            # AIR_ID (2) is ignored for liquid metrics
 
     if liquid_area <= 0:
-        return {"vial_state": "air"}
+        return {"vial_state": "air"}  # only air (or nothing detected)
 
     gel_frac = gel_area / (liquid_area + 1e-9)
-
     if gel_frac >= GEL_AREA_FRAC_THR or (n_gel - n_stable) >= GEL_DOMINANCE_COUNT_THR:
         return {"vial_state": "gel", "gel_area_frac": float(gel_frac), "n_gel": n_gel, "n_stable": n_stable}
 
     return {"vial_state": "stable", "gel_area_frac": float(gel_frac), "n_gel": n_gel, "n_stable": n_stable}
 
+def compute_turbidity_profile_v5(crop_bgr):
+    # Resize to (100, 500), HSV->V, mean over width
+    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    turb = cv2.resize(crop_rgb, (100, 500))
+    hsv = cv2.cvtColor(turb, cv2.COLOR_RGB2HSV)
+    v = np.mean(hsv[:, :, -1], axis=-1)  # (500,)
+    v_norm = (v - v.min()) / max(1e-6, (v.max() - v.min()))
+    return v, v_norm
+
+def save_turbidity_plot_for_crop(crop_path, v_norm):
+    z = np.linspace(0, 1, len(v_norm))
+    out_path = Path(crop_path).with_suffix(".turbidity.png")
+    plt.figure(figsize=(3.0, 4.0), dpi=120)
+    plt.plot(v_norm, z)
+    plt.gca().invert_yaxis()
+    plt.xlabel("Turbidity (norm)"); plt.ylabel("Normalized Height")
+    plt.title(Path(crop_path).name, fontsize=8)
+    plt.tight_layout(); plt.savefig(out_path); plt.close()
+    return str(out_path)
+
 def attach_simple_state(manifest_path, liquid_out_dir, out_path=None):
     manifest_path = Path(manifest_path)
     liquid_out_dir = Path(liquid_out_dir)
     labels_dir = liquid_out_dir / "labels"
-    out_path = Path(out_path) if out_path else manifest_path.with_name("manifest_with_state.jsonl")
+    out_path = Path(out_path) if out_path else manifest_path.parent / "manifest_with_state.jsonl"
 
     with open(manifest_path, "r") as fin, open(out_path, "w") as fout:
         for line in fin:
@@ -354,6 +368,17 @@ def attach_simple_state(manifest_path, liquid_out_dir, out_path=None):
                     label_path = alts[-1]
 
             state_info = decide_air_stable_gel_from_labels(crop_path, label_path)
+
+            img = cv2.imread(str(crop_path))
+            if img is not None:
+                v_raw, v_norm = compute_turbidity_profile_v5(img)
+                plot_path = save_turbidity_plot_for_crop(crop_path, v_norm)
+                state_info.update({
+                    "turbidity_plot": plot_path,
+                    "turbidity_mean": float(np.mean(v_norm)),
+                    "turbidity_maxstep": float(np.max(np.abs(np.diff(v_norm)))) if len(v_norm) > 1 else 0.0
+                })
+
             rec.update(state_info)
             fout.write(json.dumps(rec) + "\n")
     print(f"Wrote: {out_path}")
@@ -392,7 +417,7 @@ def parse_args():
     p.add_argument("--topk", type=int, default=-1, help="keep top-K vials per image; -1 = all")
 
     # Stage B (liquid)
-    p.add_argument("--liquid-task", choices=["detect","segment"], default="segment",
+    p.add_argument("--liquid-task", choices=["detect","segment"], default="detect",
                    help="use YOLOv5 detect.py or segment/predict.py")
     p.add_argument("--liquid-weights", type=str, required=True, help="liquid model .pt")
     p.add_argument("--liquid-imgsz", type=int, default=640, help="Stage B --img/--imgsz")
@@ -410,14 +435,17 @@ def main():
     liquid_out = run_stage_b_liquid(args, crops_dir)
     # manifest_with_state = attach_states_to_manifest(
     #     manifest_path=str(manifest),
-    #     labels_dir=str(liquid_out),                # this folder contains labels/
-    #     out_path=None                              # writes manifest_with_state.jsonl next to manifest
+    #     labels_dir=str(liquid_out),
+    #     out_path=None
     # )
 
-    # only use classification for 3 states (air, stable, gel)
+    # avoid duplication
+    stem = Path(manifest).stem.replace("manifest_", "")
+    # classification for 3 states (air, stable, gel)
     manifest_with_state = attach_simple_state(
         manifest_path=str(manifest),
-        liquid_out_dir=str(liquid_out)
+        liquid_out_dir=str(liquid_out),
+        out_path=str(Path(manifest).with_name(f"manifest_state_{stem}.jsonl"))
     )
 
     print("\n=== Pipeline complete ===")
