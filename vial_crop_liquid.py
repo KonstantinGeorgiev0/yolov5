@@ -34,12 +34,26 @@ def resize_keep_height(img, target_h):
     out = cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_AREA)
     return out, scale
 
-def run_stage_a_detect_and_crop(args):
+
+def run_stage_a_detect_and_crop(args, manifest_path=None):
+    """
+    Modified to accept optional manifest path parameter.
+    If not provided, creates temporary manifest that will be deleted.
+    """
     out_root = Path(args.outdir)
-    # crops/expN
     crops_dir = increment_path(out_root / "crops/exp", mkdir=True)
-    manifest_fp = crops_dir / f"manifest_{crops_dir.name}.jsonl"
-    mf = open(manifest_fp, "w")
+
+    # Create temporary manifest if path not provided
+    if manifest_path is None:
+        temp_manifest = True
+        manifest_fp = crops_dir / f"temp_manifest_{crops_dir.name}.jsonl"
+    else:
+        temp_manifest = False
+        manifest_fp = Path(manifest_path)
+        manifest_fp.parent.mkdir(parents=True, exist_ok=True)
+
+    # Store basic detection info temporarily
+    crop_records = []
 
     # Load vial model
     device = select_device(args.device)
@@ -50,6 +64,7 @@ def run_stage_a_detect_and_crop(args):
 
     dataset = LoadImages(args.source, img_size=imgsz, stride=stride, auto=pt)
     kept = 0
+
     for path, im, im0s, vid_cap, s in dataset:
         im_tensor = torch.from_numpy(im).to(vial_model.device)
         im_tensor = im_tensor.half() if vial_model.fp16 else im_tensor.float()
@@ -67,13 +82,13 @@ def run_stage_a_detect_and_crop(args):
             if not len(det):
                 continue
             det[:, :4] = scale_boxes(im_tensor.shape[2:], det[:, :4], im0.shape).round()
-            det = det[det[:,4].argsort(descending=True)]
+            det = det[det[:, 4].argsort(descending=True)]
             if args.topk and args.topk > 0:
                 det = det[:args.topk]
 
             for j, (*xyxy, conf, cls) in enumerate(det):
-                x1,y1,x2,y2 = map(int, xyxy)
-                x1e,y1e,x2e,y2e = expand_and_clamp(x1,y1,x2,y2, W,H, args.pad)
+                x1, y1, x2, y2 = map(int, xyxy)
+                x1e, y1e, x2e, y2e = expand_and_clamp(x1, y1, x2, y2, W, H, args.pad)
                 crop = im0[y1e:y2e, x1e:x2e].copy()
                 crop_resized, scale = resize_keep_height(crop, args.crop_h)
 
@@ -93,12 +108,13 @@ def run_stage_a_detect_and_crop(args):
                     "src_size": [int(W), int(H)],
                     "crop_size": [int(crop_resized.shape[1]), int(crop_resized.shape[0])]
                 }
-                mf.write(json.dumps(rec) + "\n")
+                crop_records.append(rec)
                 kept += 1
 
-    mf.close()
     LOGGER.info(f"[Stage A] Saved {kept} crops to {crops_dir}")
-    return crops_dir, manifest_fp
+
+    # Return records and manifest path for later use
+    return crops_dir, crop_records, manifest_fp, temp_manifest
 
 def run_stage_b_liquid(args, crops_dir):
     """Call YOLOv5 scripts for the liquid model over the crops directory."""
@@ -837,21 +853,12 @@ def save_turbidity_plot(path, v_norm, dir=None):
 
 # ---- Manifest files ---- #
 
-def attach_manifest(manifest_path, liquid_out_dir, out_path=None):
+def process_and_save_manifest(crop_records, liquid_out_dir, final_manifest_path):
     """
-    Process manifest and add four-state classification with cap detection.
+    Process all crop records and create final manifest with all information.
     """
-    manifest_path = Path(manifest_path)
     liquid_out_dir = Path(liquid_out_dir)
     labels_dir = liquid_out_dir / "labels"
-
-    if out_path is None:
-        stem = manifest_path.stem.replace("manifest_", "")
-        manifest_dir = liquid_out_dir / "manifest"
-        manifest_dir.mkdir(exist_ok=True)
-        out_path = manifest_dir / f"manifest_four_state_{stem}.jsonl"
-    else:
-        out_path = Path(out_path)
 
     processed_count = 0
     state_counts = {
@@ -863,9 +870,11 @@ def attach_manifest(manifest_path, liquid_out_dir, out_path=None):
     }
     cap_detection_count = 0
 
-    with open(manifest_path, "r") as fin, open(out_path, "w") as fout:
-        for line in fin:
-            rec = json.loads(line)
+    # Ensure output directory exists
+    final_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(final_manifest_path, "w") as fout:
+        for rec in crop_records:
             crop_path = Path(rec["crop_image"])
             label_path = labels_dir / f"{crop_path.stem}.txt"
 
@@ -882,12 +891,12 @@ def attach_manifest(manifest_path, liquid_out_dir, out_path=None):
             if state_info.get("cap_info", {}).get("detected", False):
                 cap_detection_count += 1
 
-            # Enhanced turbidity analysis with region exclusion
+            # Enhanced turbidity analysis
             img = cv2.imread(str(crop_path))
             if img is not None:
-                # Create turbidity dir
+                # Create turbidity directory
                 turbidity_dir = liquid_out_dir / "turbidity"
-                turbidity_dir.mkdir(exist_ok=True)
+                turbidity_dir.mkdir(parents=True, exist_ok=True)
 
                 # Extract cap info for turbidity analysis
                 cap_bottom_y = None
@@ -911,7 +920,7 @@ def attach_manifest(manifest_path, liquid_out_dir, out_path=None):
                     "turbidity_excluded_regions": excluded_info
                 })
 
-            # Update record and counts
+            # Combine all information
             rec.update(state_info)
             fout.write(json.dumps(rec) + "\n")
 
@@ -919,7 +928,7 @@ def attach_manifest(manifest_path, liquid_out_dir, out_path=None):
             state_counts[state] = state_counts.get(state, 0) + 1
             processed_count += 1
 
-    # Enhanced summary output
+    # Print summary
     print(f"\n=== Processing Summary ===")
     print(f"Total vials processed: {processed_count}")
     print(f"Caps detected: {cap_detection_count} ({cap_detection_count / processed_count * 100:.1f}%)")
@@ -929,8 +938,8 @@ def attach_manifest(manifest_path, liquid_out_dir, out_path=None):
             percentage = (count / processed_count) * 100
             print(f"  {state}: {count} ({percentage:.1f}%)")
 
-    print(f"\nResults saved to: {out_path}")
-    return out_path
+    print(f"\nManifest saved to: {final_manifest_path}")
+    return final_manifest_path
 
 def parse_args():
     p = argparse.ArgumentParser("Vial → Crop → Liquid")
@@ -966,106 +975,34 @@ def main():
     args = parse_args()
 
     # Stage A: Detect vials and create crops
-    crops_dir, manifest = run_stage_a_detect_and_crop(args)
-    # Stage B: Run liquid detection (including cap detection)
+    crops_dir, crop_records, temp_manifest_path, is_temp = run_stage_a_detect_and_crop(args, manifest_path=None)
+
+    # Stage B: Run liquid detection
     liquid_out = run_stage_b_liquid(args, crops_dir)
 
-    # avoid duplication
-    stem = Path(manifest).stem.replace("manifest_", "")
-
-    # classification with cap detection
-    manifest_with_state = attach_manifest(
-        manifest_path=str(manifest),
-        liquid_out_dir=str(liquid_out),
-        out_path=str(Path(manifest).with_name(f"manifest_full_{stem}.jsonl"))
-    )
-    # move manifest file
-    manifest_dir = Path(liquid_out) / "manifest"
+    # Define final manifest location
+    manifest_dir = liquid_out / "manifest"
     manifest_dir.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(manifest), str(manifest_dir / Path(manifest).name))
 
-    print("\n=== Pipeline complete ===")
+    # Extract experiment name
+    exp_name = crops_dir.name
+    final_manifest_path = manifest_dir / f"manifest_full_{exp_name}.jsonl"
+
+    # Process all records and create final manifest
+    manifest_with_state = process_and_save_manifest(
+        crop_records,
+        liquid_out,
+        final_manifest_path
+    )
+
+    # Clean up temporary manifest if created
+    if is_temp and temp_manifest_path.exists():
+        temp_manifest_path.unlink()
+
+    print("\n=== Pipeline Complete ===")
     print(f"Crops:       {crops_dir}")
-    print(f"Manifest:    {manifest_dir / Path(manifest).name}")
-    # print(f"Manifest:    {manifest}")
     print(f"Liquid out:  {liquid_out}")
-    print(f"With state:  {manifest_with_state}")
-
-    # summary statistics
-    # generate_summary_report(manifest_with_state)
-
-# def generate_summary_report(manifest_path):
-#     """
-#     Generate a summary report of the processing results.
-#     """
-#     summary = {
-#         "total_vials": 0,
-#         "state_counts": {},
-#         "cap_statistics": {
-#             "detected": 0,
-#             "not_detected": 0,
-#             "avg_cap_confidence": [],
-#             "avg_cap_height_fraction": []
-#         },
-#         "turbidity_stats": {
-#             "mean_turbidity": [],
-#             "max_step": []
-#         }
-#     }
-#
-#     with open(manifest_path, "r") as f:
-#         for line in f:
-#             rec = json.loads(line)
-#             summary["total_vials"] += 1
-#
-#             # State counting
-#             state = rec.get("vial_state", "unknown")
-#             summary["state_counts"][state] = summary["state_counts"].get(state, 0) + 1
-#
-#             # Cap statistics
-#             if rec.get("cap_info", {}).get("detected", False):
-#                 summary["cap_statistics"]["detected"] += 1
-#                 summary["cap_statistics"]["avg_cap_confidence"].append(
-#                     rec["cap_info"]["confidence"]
-#                 )
-#                 summary["cap_statistics"]["avg_cap_height_fraction"].append(
-#                     rec["cap_info"]["height_fraction"]
-#                 )
-#             else:
-#                 summary["cap_statistics"]["not_detected"] += 1
-#
-#             # Turbidity statistics
-#             if "turbidity_mean" in rec:
-#                 summary["turbidity_stats"]["mean_turbidity"].append(rec["turbidity_mean"])
-#             if "turbidity_maxstep" in rec:
-#                 summary["turbidity_stats"]["max_step"].append(rec["turbidity_maxstep"])
-#
-#     # Calculate averages
-#     if summary["cap_statistics"]["avg_cap_confidence"]:
-#         summary["cap_statistics"]["avg_cap_confidence"] = np.mean(
-#             summary["cap_statistics"]["avg_cap_confidence"]
-#         )
-#         summary["cap_statistics"]["avg_cap_height_fraction"] = np.mean(
-#             summary["cap_statistics"]["avg_cap_height_fraction"]
-#         )
-#
-#     if summary["turbidity_stats"]["mean_turbidity"]:
-#         summary["turbidity_stats"]["avg_mean_turbidity"] = np.mean(
-#             summary["turbidity_stats"]["mean_turbidity"]
-#         )
-#         summary["turbidity_stats"]["avg_max_step"] = np.mean(
-#             summary["turbidity_stats"]["max_step"]
-#         )
-#         del summary["turbidity_stats"]["mean_turbidity"]
-#         del summary["turbidity_stats"]["max_step"]
-#
-#     # Save summary
-#     summary_path = Path(manifest_path).with_suffix(".summary.json")
-#     with open(summary_path, "w") as f:
-#         json.dump(summary, f, indent=2)
-#
-#     print(f"\nSummary report saved to: {summary_path}")
-#     return summary
+    print(f"Final manifest: {manifest_with_state}")
 
 if __name__ == "__main__":
     main()
