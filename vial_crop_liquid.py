@@ -7,6 +7,7 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
 # --- YOLOv5 internals ---
 from models.common import DetectMultiBackend
@@ -101,43 +102,43 @@ def run_stage_a_detect_and_crop(args):
 
 def run_stage_b_liquid(args, crops_dir):
     """Call YOLOv5 scripts for the liquid model over the crops directory."""
-    crops_dir = str(crops_dir)
-    out_dir = str(Path(args.outdir) / "liquid_runs")
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    crops_dir = Path(crops_dir)
+    exp_name = crops_dir.name
+    out_dir = Path(args.outdir) / "liquid_runs"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.liquid_task == "detect":
         cmd = [
             "python3", "yolov5/detect.py",
             "--weights", args.liquid_weights,
-            "--source", crops_dir,
-            "--imgsz", str(args.liquid_imgsz),
-            "--conf-thres", str(args.liquid_conf),
-            "--iou-thres", str(args.liquid_iou),
-            "--save-txt", "--save-conf",
-            "--project", out_dir,
-            "--line-thickness", "1",
-            # "--name", "exp",
-            # "--exist-ok"
-        ]
-    elif args.liquid_task == "segment":
-        # Uses YOLOv5 seg pipeline
-        cmd = [
-            "python3", "yolov5/segment/predict.py",
-            "--weights", args.liquid_weights,
-            "--source", crops_dir,
+            "--source", str(crops_dir),
             "--imgsz", str(args.liquid_imgsz),
             "--conf", str(args.liquid_conf),
             "--iou", str(args.liquid_iou),
-            "--project", out_dir,
-            "--name", "exp",
-            "--exist-ok"
+            "--save-txt", "--save-conf",
+            "--project", str(out_dir),
+            "--name", exp_name,
+            "--line-thickness", "1",
+            "--exist-ok",
+        ]
+    elif args.liquid_task == "segment":
+        cmd = [
+            "python3", "yolov5/segment/predict.py",
+            "--weights", args.liquid_weights,
+            "--source", str(crops_dir),
+            "--imgsz", str(args.liquid_imgsz),
+            "--conf", str(args.liquid_conf),
+            "--iou", str(args.liquid_iou),
+            "--project", str(out_dir),
+            "--name", exp_name,
+            "--exist-ok",
         ]
     else:
         raise ValueError("liquid_task must be 'detect' or 'segment'.")
 
     LOGGER.info(f"[Stage B] Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
-    return Path(out_dir) / "exp"
+    return out_dir / exp_name
 
 # ---------- Post-processing: decide vial state from detection boxes ----------
 
@@ -175,298 +176,8 @@ def yolo_line_to_xyxy(line, W, H):
 def box_area(b):
     x1,y1,x2,y2 = b
     return max(0, x2-x1) * max(0, y2-y1)
-#
-# def iou(a, b):
-#     ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
-#     ix1,iy1 = max(ax1,bx1), max(ay1,by1)
-#     ix2,iy2 = min(ax2,bx2), min(ay2,by2)
-#     iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
-#     inter = iw*ih
-#     ua = box_area(a) + box_area(b) - inter
-#     return inter / (ua + 1e-9)
-#
-# def merge_boxes_conf(boxes_conf, iou_thr=IOU_MERGE_THR):
-#     # boxes_conf: list of (conf, box)
-#     merged = []
-#     for conf, bb in sorted(boxes_conf, key=lambda x: x[0], reverse=True):
-#         keep = True
-#         for _, mb in merged:
-#             if iou(bb, mb) > iou_thr:
-#                 keep = False; break
-#         if keep:
-#             merged.append((conf, bb))
-#     return merged
-#
-# def strongest_vertical_step(crop_bgr):
-#     gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-#     prof = np.median(gray, axis=1)       # vertical profile
-#     diffs = np.abs(np.diff(prof))
-#     return float(diffs.max()) if diffs.size else 0.0
-#
-# def compute_layers_and_gel_fraction(liquid_boxes, crop_h):
-#     """Return estimated #layers and gel area fraction among liquid area."""
-#     if not liquid_boxes:
-#         return 0, 0.0
-#
-#     # merge near-duplicate boxes
-#     merged = merge_boxes_conf([(1.0, b) for b in liquid_boxes])  # ignore conf
-#     centers = []
-#     for _, (x1,y1,x2,y2) in merged:
-#         cy = 0.5*(y1+y2)/crop_h
-#         centers.append(cy)
-#     centers.sort()
-#
-#     # count distinct vertically separated bands
-#     layers = 1
-#     for i in range(1, len(centers)):
-#         if centers[i] - centers[i-1] > PHASE_LAYER_MIN_GAP:
-#             layers += 1
-#
-#     return layers, 0.0  # gel fraction computed elsewhere
 
-# def decide_state_from_boxes(crop_path, label_path, cls_map=(AIR_ID, STABLE_ID, GEL_ID)):
-#     crop = cv2.imread(str(crop_path))
-#     if crop is None:
-#         return {"vial_state": "unknown", "reason": "crop_not_found"}
-#
-#     H, W = crop.shape[:2]
-#     liquid_boxes = []
-#     gel_boxes = []
-#     total_liquid_area = 0.0
-#     gel_area = 0.0
-#
-#     if not Path(label_path).exists():
-#         # No detections → either air-only or low-conf missed;
-#         return {"vial_state": "air_only", "num_layers": 0, "gel_area_frac": 0.0, "step": strongest_vertical_step(crop)}
-#
-#     with open(label_path) as f:
-#         for line in f:
-#             parsed = yolo_line_to_xyxy(line, W, H)
-#             if not parsed:
-#                 continue
-#             cls, box, conf = parsed
-#             if cls in LIQUID_CLASSES:
-#                 liquid_boxes.append(box)
-#                 total_liquid_area += box_area(box)
-#                 if cls == GEL_ID:
-#                     gel_boxes.append(box)
-#                     gel_area += box_area(box)
-#
-#     # layer count
-#     n_layers, _ = compute_layers_and_gel_fraction(liquid_boxes, H)
-#
-#     # backup: vertical intensity step
-#     step = strongest_vertical_step(crop)
-#
-#     # gel fraction
-#     gel_frac = (gel_area / (total_liquid_area + 1e-9)) if total_liquid_area > 0 else 0.0
-#
-#     # Decision tree
-#     if n_layers >= 2 or step > STEP_THR:
-#         state = "phase_separated"
-#     else:
-#         if gel_frac >= GEL_AREA_FRAC_THR:
-#             state = "gelled"
-#         else:
-#             # if any liquid boxes exist -> stable; else air_only
-#             state = "stable" if total_liquid_area > 0 else "air_only"
-#
-#     return {
-#         "vial_state": state,
-#         "num_layers": int(n_layers),
-#         "gel_area_frac": float(gel_frac),
-#         "step": float(step)
-#     }
-
-# def infer_air_present(liquid_boxes_px, H):
-#     if not liquid_boxes_px:
-#         return True  # no liquid boxes => air-only
-#     top_y = min(b[1] for b in liquid_boxes_px)
-#     return (top_y / float(H)) >= AIR_GAP_THR
-#
-# def decide_air_stable_gel_from_labels(crop_path: Path, label_path: Path):
-#     img = cv2.imread(str(crop_path))
-#     if img is None:
-#         return {"vial_state": "air", "reason": "crop_not_found"}
-#
-#     H, W = img.shape[:2]
-#     if not label_path.exists():
-#         return {"vial_state": "air", "reason": "no_label_file"}
-#
-#     liquid_area = 0.0
-#     gel_area = 0.0
-#     n_stable = 0
-#     n_gel = 0
-#     liquid_boxes_px = []
-#
-#     with open(label_path) as f:
-#         for raw in f:
-#             raw = raw.strip()
-#             if not raw:
-#                 continue
-#             parsed = yolo_line_to_xyxy(raw, W, H)
-#             if not parsed:
-#                 continue
-#             cid, box, conf = parsed
-#             if conf < CONF_MIN:
-#                 continue
-#
-#             if is_liquid_cls(cid):
-#                 liquid_boxes_px.append(box)
-#                 a = box_area(box)
-#                 liquid_area += a
-#                 if cid == GEL_ID:
-#                     gel_area += a
-#                     n_gel += 1
-#                 elif cid == STABLE_ID:
-#                     n_stable += 1
-#             # AIR_ID (2) is ignored for liquid metrics
-#
-#     if liquid_area <= 0:
-#         return {"vial_state": "air"}  # only air (or nothing detected)
-#
-#     gel_frac = gel_area / (liquid_area + 1e-9)
-#     if gel_frac >= GEL_AREA_FRAC_THR or (n_gel - n_stable) >= GEL_DOMINANCE_COUNT_THR:
-#         return {"vial_state": "gel", "gel_area_frac": float(gel_frac), "n_gel": n_gel, "n_stable": n_stable}
-#
-#     return {"vial_state": "stable", "gel_area_frac": float(gel_frac), "n_gel": n_gel, "n_stable": n_stable}
-
-# ---- Four state classification ---- #
-
-def decide_four_state_classification(crop_path: Path, label_path: Path):
-    """
-    Classify vial contents into exactly four states:
-    - stable: Normal liquid
-    - gelled: Gel/solidified liquid
-    - phase_separated: Multiple distinct liquid layers
-    - only_air: Completely empty vial
-    """
-    img = cv2.imread(str(crop_path))
-    if img is None:
-        return {"vial_state": "unknown", "reason": "crop_not_found"}
-
-    H, W = img.shape[:2]
-
-    # determine air-only or detection failure
-    if not label_path.exists():
-        # Analyze image
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # Check if image looks like empty vial (bright, uniform)
-        mean_brightness = np.mean(gray)
-        brightness_std = np.std(gray)
-
-        # Empty vials typically have high brightness and low variation
-        if mean_brightness > 150 and brightness_std < 30:
-            return {
-                "vial_state": "only_air",
-                "reason": "no_detections_appears_empty",
-                "brightness_metrics": {
-                    "mean_brightness": float(mean_brightness),
-                    "brightness_std": float(brightness_std)
-                }
-            }
-        else:
-            return {
-                "vial_state": "unknown",
-                "reason": "detection_failed",
-                "brightness_metrics": {
-                    "mean_brightness": float(mean_brightness),
-                    "brightness_std": float(brightness_std)
-                }
-            }
-
-    # Parse all detections
-    detections = []
-    liquid_area = 0.0
-    gel_area = 0.0
-    n_stable = 0
-    n_gel = 0
-    liquid_boxes = []
-
-    with open(label_path) as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            parsed = yolo_line_to_xyxy(raw, W, H)
-            if not parsed:
-                continue
-            cid, box, conf = parsed
-            if conf < CONF_MIN:
-                continue
-
-            detections.append({
-                'class_id': cid,
-                'box': box,
-                'confidence': conf,
-                'center_y': (box[1] + box[3]) / 2.0,  # Vertical center position
-                'area': box_area(box)
-            })
-
-            # Only count liquid classes for area calculations
-            if is_liquid_cls(cid):
-                liquid_boxes.append(box)
-                area = box_area(box)
-                liquid_area += area
-
-                if cid == GEL_ID:
-                    gel_area += area
-                    n_gel += 1
-                elif cid == STABLE_ID:
-                    n_stable += 1
-
-            elif cid == CAP_ID:
-                # Cap detection - this indicates vial top/closure
-                cap_area = box_area(box)
-
-    # If no liquid detected at all, it's only air
-    if liquid_area <= 0:
-        return {
-            "vial_state": "only_air",
-            "reason": "no_liquid_detected",
-            "total_detections": len(detections)
-        }
-
-    # Check for phase separation first
-    is_phase_separated = detect_phase_separation_logic(detections, H)
-
-    # Add turbidity-based fallback detection
-    if not is_phase_separated and img is not None and len([d for d in detections if is_liquid_cls(d['class_id'])]) >= 2:
-        is_phase_separated = detect_phase_separation_from_turbidity(img)
-
-    if is_phase_separated:
-        return {
-            "vial_state": "phase_separated",
-            "n_gel": n_gel,
-            "n_stable": n_stable,
-            "gel_area_frac": gel_area / liquid_area,
-            "phase_separation_metrics": analyze_phase_separation(detections, H)
-        }
-
-    # Distinguish between gelled vs stable
-    gel_frac = gel_area / liquid_area
-
-    # Multiple criteria for gel classification
-    is_gelled = (
-            gel_frac >= GEL_AREA_FRAC_THR or  # Area-based: gel covers % of liquid
-            (n_gel - n_stable) >= GEL_DOMINANCE_COUNT_THR  # Count-based: more gel than stable boxes
-    )
-
-    final_state = "gelled" if is_gelled else "stable"
-    # calculate volume estimates
-    volume_estimates = calculate_liquid_volumes(detections, H, W)
-
-    return {
-        "vial_state": final_state,
-        "gel_area_frac": float(gel_frac),
-        "n_gel": n_gel,
-        "n_stable": n_stable,
-        "liquid_coverage": liquid_area / (W * H),
-        "classification_confidence": calculate_classification_confidence(detections),
-        "volume_estimates_ml": volume_estimates
-    }
-
+# ---- State classification ---- #
 
 def detect_phase_separation_from_turbidity(img):
     """
@@ -478,7 +189,7 @@ def detect_phase_separation_from_turbidity(img):
         v_raw, v_norm = compute_turbidity_profile_v5(img)
 
         # Define exclude regions
-        top_exclude = 0.15
+        top_exclude = 0.25
         bottom_exclude = 0.05
 
         # Calculate indices for analysis region
@@ -619,7 +330,7 @@ def analyze_phase_separation(detections, vial_height):
     current_layer = [liquid_detections[0]]
 
     # Group detections into layers based on vertical proximity
-    layer_tolerance = vial_height * 0.1  # 10% of vial height
+    layer_tolerance = vial_height * 0.1  # % of vial height
 
     for i in range(1, len(liquid_detections)):
         det = liquid_detections[i]
@@ -694,6 +405,409 @@ def calculate_liquid_volumes(detections, vial_height, vial_width, vial_volume_ml
 
     return volumes
 
+
+def detect_cap_region(detections, img_height):
+    """
+    Detect cap region from YOLO detections.
+    Returns the bottom Y-coordinate of the cap region (or None if no cap detected).
+
+    Args:
+        detections: List of detection dictionaries with 'class_id', 'box', etc.
+        img_height: Height of the image
+
+    Returns:
+        tuple: (cap_bottom_y, cap_info_dict) or (None, None)
+    """
+    cap_detections = [d for d in detections if d['class_id'] == CAP_ID]
+
+    if not cap_detections:
+        return None, None
+
+    # If multiple caps detected, use the topmost one (lowest y1)
+    cap_detections.sort(key=lambda d: d['box'][1])  # Sort by top y coordinate
+    primary_cap = cap_detections[0]
+
+    cap_info = {
+        'detected': True,
+        'box': primary_cap['box'],
+        'confidence': primary_cap['confidence'],
+        'bottom_y': primary_cap['box'][3],  # y2 coordinate
+        'top_y': primary_cap['box'][1],  # y1 coordinate
+        'height_fraction': (primary_cap['box'][3] - primary_cap['box'][1]) / img_height,
+        'num_cap_detections': len(cap_detections)
+    }
+
+    return primary_cap['box'][3], cap_info
+
+
+def compute_turbidity_profile_with_exclusion(crop_bgr, cap_bottom_y=None,
+                                             top_exclude_fraction=0.15,
+                                             bottom_exclude_fraction=0.05):
+    """
+    Compute turbidity profile with intelligent region exclusion.
+
+    Args:
+        crop_bgr: BGR image of the crop
+        cap_bottom_y: Y-coordinate of cap bottom (if detected)
+        top_exclude_fraction: Default fraction to exclude from top if no cap
+        bottom_exclude_fraction: Fraction to exclude from bottom
+
+    Returns:
+        tuple: (v_raw, v_norm, excluded_regions_info)
+    """
+    # Resize to standard size for analysis
+    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    h_original, w_original = crop_bgr.shape[:2]
+
+    # Standard analysis size
+    analysis_width = 100
+    analysis_height = 500
+    turb = cv2.resize(crop_rgb, (analysis_width, analysis_height))
+
+    # Convert to HSV and extract Value channel
+    hsv = cv2.cvtColor(turb, cv2.COLOR_RGB2HSV)
+    v_full = np.mean(hsv[:, :, -1], axis=-1)  # (500,)
+
+    # Calculate exclusion regions
+    if cap_bottom_y is not None:
+        # Scale cap position to analysis dimensions
+        cap_bottom_scaled = int((cap_bottom_y / h_original) * analysis_height)
+        # Add small buffer below cap
+        top_exclude_idx = min(cap_bottom_scaled + 10, analysis_height // 3)
+    else:
+        # Use default top exclusion
+        top_exclude_idx = int(analysis_height * top_exclude_fraction)
+
+    # Bottom exclusion (vial bottom artifacts)
+    bottom_exclude_idx = int(analysis_height * (1 - bottom_exclude_fraction))
+
+    # Extract analysis region
+    v_analysis = v_full[top_exclude_idx:bottom_exclude_idx]
+
+    # Normalize the analysis region
+    if len(v_analysis) > 0:
+        v_norm = (v_analysis - v_analysis.min()) / max(1e-6, (v_analysis.max() - v_analysis.min()))
+    else:
+        v_norm = np.array([])
+
+    # Create full profile with excluded regions marked
+    v_full_norm = np.zeros_like(v_full)
+    if len(v_norm) > 0:
+        v_full_norm[top_exclude_idx:bottom_exclude_idx] = v_norm
+
+    excluded_info = {
+        'top_exclude_idx': top_exclude_idx,
+        'bottom_exclude_idx': bottom_exclude_idx,
+        'analysis_height': analysis_height,
+        'excluded_top_fraction': top_exclude_idx / analysis_height,
+        'excluded_bottom_fraction': (analysis_height - bottom_exclude_idx) / analysis_height,
+        'cap_detected': cap_bottom_y is not None
+    }
+
+    return v_full, v_full_norm, excluded_info
+
+
+def enhanced_decide(crop_path: Path, label_path: Path):
+    """
+    Enhanced four-state classification with cap detection integration.
+    """
+    img = cv2.imread(str(crop_path))
+    if img is None:
+        return {"vial_state": "unknown", "reason": "crop_not_found"}
+
+    H, W = img.shape[:2]
+
+    # Handle no detection file
+    if not label_path.exists():
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        mean_brightness = np.mean(gray)
+        brightness_std = np.std(gray)
+
+        if mean_brightness > 150 and brightness_std < 30:
+            return {
+                "vial_state": "only_air",
+                "reason": "no_detections_appears_empty",
+                "cap_detected": False,
+                "brightness_metrics": {
+                    "mean_brightness": float(mean_brightness),
+                    "brightness_std": float(brightness_std)
+                }
+            }
+        else:
+            return {
+                "vial_state": "unknown",
+                "reason": "detection_failed",
+                "cap_detected": False,
+                "brightness_metrics": {
+                    "mean_brightness": float(mean_brightness),
+                    "brightness_std": float(brightness_std)
+                }
+            }
+
+    # Parse all detections including caps
+    detections = []
+    liquid_area = 0.0
+    gel_area = 0.0
+    n_stable = 0
+    n_gel = 0
+    liquid_boxes = []
+    cap_info = None
+
+    with open(label_path) as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            parsed = yolo_line_to_xyxy(raw, W, H)
+            if not parsed:
+                continue
+            cid, box, conf = parsed
+            if conf < 0.20:  # CONF_MIN
+                continue
+
+            det_dict = {
+                'class_id': cid,
+                'box': box,
+                'confidence': conf,
+                'center_y': (box[1] + box[3]) / 2.0,
+                'area': box_area(box)
+            }
+            detections.append(det_dict)
+
+            if is_liquid_cls(cid):
+                liquid_boxes.append(box)
+                area = box_area(box)
+                liquid_area += area
+
+                if cid == GEL_ID:
+                    gel_area += area
+                    n_gel += 1
+                elif cid == STABLE_ID:
+                    n_stable += 1
+
+    # Detect cap region
+    cap_bottom_y, cap_info = detect_cap_region(detections, H)
+
+    # Filter liquid detections below cap if cap detected
+    if cap_bottom_y is not None:
+        # Only consider liquid below the cap
+        liquid_detections_filtered = []
+        for det in detections:
+            if is_liquid_cls(det['class_id']):
+                if det['box'][1] > cap_bottom_y:  # Top of box is below cap
+                    liquid_detections_filtered.append(det)
+
+        # Recalculate liquid areas excluding those above cap
+        if liquid_detections_filtered:
+            liquid_area = sum(d['area'] for d in liquid_detections_filtered)
+            gel_area = sum(d['area'] for d in liquid_detections_filtered if d['class_id'] == GEL_ID)
+
+    # If no liquid detected, it's only air
+    if liquid_area <= 0:
+        result = {
+            "vial_state": "only_air",
+            "reason": "no_liquid_detected",
+            "total_detections": len(detections)
+        }
+        if cap_info:
+            result["cap_info"] = cap_info
+        return result
+
+    # Check for phase separation
+    is_phase_separated = detect_phase_separation_logic(detections, H)
+
+    # Enhanced turbidity analysis with cap exclusion
+    if not is_phase_separated and img is not None:
+        is_phase_separated = enhanced_detect_phase_separation_from_turbidity(
+            img, cap_bottom_y
+        )
+
+    if is_phase_separated:
+        result = {
+            "vial_state": "phase_separated",
+            "n_gel": n_gel,
+            "n_stable": n_stable,
+            "gel_area_frac": gel_area / liquid_area if liquid_area > 0 else 0,
+            "phase_separation_metrics": analyze_phase_separation(detections, H)
+        }
+        if cap_info:
+            result["cap_info"] = cap_info
+        return result
+
+    # Distinguish between gelled vs stable
+    gel_frac = gel_area / liquid_area if liquid_area > 0 else 0
+
+    is_gelled = (
+            gel_frac >= 0.35 or  # GEL_AREA_FRAC_THR
+            (n_gel - n_stable) >= 1  # GEL_DOMINANCE_COUNT_THR
+    )
+
+    final_state = "gelled" if is_gelled else "stable"
+
+    # Calculate liquid volume below cap
+    if cap_bottom_y:
+        # Adjust volume calculation to exclude cap region
+        effective_height = H - cap_bottom_y
+        volume_estimates = calculate_liquid_volumes_with_exclusion(
+            detections, effective_height, W, cap_bottom_y
+        )
+    else:
+        volume_estimates = calculate_liquid_volumes(detections, H, W)
+
+    result = {
+        "vial_state": final_state,
+        "gel_area_frac": float(gel_frac),
+        "n_gel": n_gel,
+        "n_stable": n_stable,
+        "liquid_coverage": liquid_area / (W * H),
+        "volume_estimates_ml": volume_estimates
+    }
+
+    if cap_info:
+        result["cap_info"] = cap_info
+
+    return result
+
+
+def enhanced_detect_phase_separation_from_turbidity(img, cap_bottom_y=None):
+    """
+    Detect phase separation with cap-aware region exclusion.
+    """
+    try:
+        # Compute turbidity with intelligent exclusion
+        v_raw, v_norm, excluded_info = compute_turbidity_profile_with_exclusion(
+            img, cap_bottom_y
+        )
+
+        if len(v_norm) < 50:  # Minimum profile length
+            return False
+
+        # Calculate gradient only in the analysis region
+        gradient = np.abs(np.gradient(v_norm))
+
+        # Conservative threshold
+        threshold = np.mean(gradient) + 2.5 * np.std(gradient)
+        threshold = max(threshold, 0.06)
+
+        # Find significant peaks
+        significant_peaks = gradient > threshold
+        peak_positions = np.where(significant_peaks)[0]
+
+        if len(peak_positions) < 3:
+            return False
+
+        # Group nearby peaks
+        min_separation = len(v_norm) * 0.08
+        peak_groups = []
+        current_group = [peak_positions[0]]
+
+        for i in range(1, len(peak_positions)):
+            if peak_positions[i] - peak_positions[i - 1] < min_separation:
+                current_group.append(peak_positions[i])
+            else:
+                peak_groups.append(current_group)
+                current_group = [peak_positions[i]]
+        peak_groups.append(current_group)
+
+        # Require substantial peak groups
+        substantial_groups = [group for group in peak_groups if len(group) >= 2]
+        return len(substantial_groups) >= 2
+
+    except Exception as e:
+        print(f"Turbidity analysis failed: {e}")
+        return False
+
+
+def calculate_liquid_volumes_with_exclusion(detections, effective_height, vial_width,
+                                            cap_bottom_y, vial_volume_ml=1.8):
+    """
+    Calculate liquid volumes excluding cap region.
+    """
+    volumes = {}
+    # Only consider area below cap
+    effective_area = effective_height * vial_width
+
+    for detection in detections:
+        if is_liquid_cls(detection['class_id']):
+            # Only count if detection is below cap
+            if detection['box'][1] >= cap_bottom_y:
+                # Adjust area calculation
+                adjusted_area = detection['area']
+                area_fraction = adjusted_area / effective_area
+                volume_ml = area_fraction * vial_volume_ml * 0.85  # Adjustment factor
+
+                class_name = 'gel' if detection['class_id'] == GEL_ID else 'stable'
+                if class_name not in volumes:
+                    volumes[class_name] = 0.0
+                volumes[class_name] += volume_ml
+
+    return volumes
+
+
+def save_enhanced_turbidity_plot(path, v_norm, excluded_info, dir=None):
+    """
+    Save turbidity plot with excluded regions visualization.
+    """
+
+    z = np.linspace(0, 1, len(v_norm))
+
+    if dir is not None:
+        filename = Path(path).stem + ".turbidity_enhanced.png"
+        out_path = dir / filename
+    else:
+        out_path = Path(path).with_suffix(".turbidity_enhanced.png")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(6, 4), dpi=120)
+
+    # Plot 1: Turbidity profile with excluded regions
+    ax1.plot(v_norm, z, 'b-', linewidth=2)
+
+    # Mark excluded regions
+    if excluded_info:
+        top_exc = excluded_info['excluded_top_fraction']
+        bottom_exc = excluded_info['excluded_bottom_fraction']
+
+        # Shade excluded regions
+        ax1.axhspan(0, top_exc, alpha=0.2, color='red', label='Excluded (top)')
+        ax1.axhspan(1 - bottom_exc, 1, alpha=0.2, color='orange', label='Excluded (bottom)')
+
+    ax1.invert_yaxis()
+    ax1.set_xlabel("Turbidity (normalized)")
+    ax1.set_ylabel("Normalized Height")
+    ax1.set_title("Turbidity Profile", fontsize=10)
+    ax1.legend(loc='best', fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # Plot 2: Gradient analysis
+    if len(v_norm) > 1:
+        gradient = np.abs(np.gradient(v_norm))
+        z_grad = np.linspace(0, 1, len(gradient))
+        ax2.plot(gradient, z_grad, 'g-', linewidth=2)
+
+        # Mark significant peaks
+        threshold = np.mean(gradient) + 2.5 * np.std(gradient)
+        peaks = gradient > threshold
+        if np.any(peaks):
+            ax2.scatter(gradient[peaks], z_grad[peaks], c='red', s=20,
+                        label='Significant peaks', zorder=5)
+
+        ax2.axvline(threshold, color='r', linestyle='--', alpha=0.5,
+                    label=f'Threshold: {threshold:.3f}')
+
+    ax2.invert_yaxis()
+    ax2.set_xlabel("Gradient Magnitude")
+    ax2.set_ylabel("Normalized Height")
+    ax2.set_title("Gradient Analysis", fontsize=10)
+    ax2.legend(loc='best', fontsize=8)
+    ax2.grid(True, alpha=0.3)
+
+    plt.suptitle(Path(path).name, fontsize=9)
+    plt.tight_layout()
+    plt.savefig(out_path, bbox_inches='tight')
+    plt.close()
+
+    return str(out_path)
+
 # ---- Turbidity Analysis ---- #
 
 def compute_turbidity_profile_v5(crop_bgr):
@@ -723,9 +837,9 @@ def save_turbidity_plot(path, v_norm, dir=None):
 
 # ---- Manifest files ---- #
 
-def attach_four_state_classification(manifest_path, liquid_out_dir, out_path=None):
+def attach_manifest(manifest_path, liquid_out_dir, out_path=None):
     """
-    Process manifest and add four-state classification to each vial crop.
+    Process manifest and add four-state classification with cap detection.
     """
     manifest_path = Path(manifest_path)
     liquid_out_dir = Path(liquid_out_dir)
@@ -740,7 +854,14 @@ def attach_four_state_classification(manifest_path, liquid_out_dir, out_path=Non
         out_path = Path(out_path)
 
     processed_count = 0
-    state_counts = {"stable": 0, "gelled": 0, "phase_separated": 0, "only_air": 0, "unknown": 0}
+    state_counts = {
+        "stable": 0,
+        "gelled": 0,
+        "phase_separated": 0,
+        "only_air": 0,
+        "unknown": 0
+    }
+    cap_detection_count = 0
 
     with open(manifest_path, "r") as fin, open(out_path, "w") as fout:
         for line in fin:
@@ -754,22 +875,40 @@ def attach_four_state_classification(manifest_path, liquid_out_dir, out_path=Non
                 if alts:
                     label_path = alts[-1]
 
-            # Perform four-state classification
-            state_info = decide_four_state_classification(crop_path, label_path)
+            # Use enhanced classification with cap detection
+            state_info = enhanced_decide(crop_path, label_path)
 
-            # Add turbidity analysis
+            # Track cap detections
+            if state_info.get("cap_info", {}).get("detected", False):
+                cap_detection_count += 1
+
+            # Enhanced turbidity analysis with region exclusion
             img = cv2.imread(str(crop_path))
             if img is not None:
-                # Create turbidity directory
+                # Create turbidity dir
                 turbidity_dir = liquid_out_dir / "turbidity"
                 turbidity_dir.mkdir(exist_ok=True)
 
-                v_raw, v_norm = compute_turbidity_profile_v5(img)
-                plot_path = save_turbidity_plot(crop_path, v_norm, turbidity_dir)
+                # Extract cap info for turbidity analysis
+                cap_bottom_y = None
+                if state_info.get("cap_info", {}).get("detected", False):
+                    cap_bottom_y = state_info["cap_info"]["bottom_y"]
+
+                # Compute turbidity with exclusion
+                v_raw, v_norm, excluded_info = compute_turbidity_profile_with_exclusion(
+                    img, cap_bottom_y
+                )
+
+                # Save enhanced plot
+                plot_path = save_enhanced_turbidity_plot(
+                    crop_path, v_norm, excluded_info, turbidity_dir
+                )
+
                 state_info.update({
                     "turbidity_plot": plot_path,
-                    "turbidity_mean": float(np.mean(v_norm)),
-                    "turbidity_maxstep": float(np.max(np.abs(np.diff(v_norm)))) if len(v_norm) > 1 else 0.0
+                    "turbidity_mean": float(np.mean(v_norm)) if len(v_norm) > 0 else 0.0,
+                    "turbidity_maxstep": float(np.max(np.abs(np.diff(v_norm)))) if len(v_norm) > 1 else 0.0,
+                    "turbidity_excluded_regions": excluded_info
                 })
 
             # Update record and counts
@@ -780,66 +919,18 @@ def attach_four_state_classification(manifest_path, liquid_out_dir, out_path=Non
             state_counts[state] = state_counts.get(state, 0) + 1
             processed_count += 1
 
-    print(f"Processed {processed_count} vial crops:")
+    # Enhanced summary output
+    print(f"\n=== Processing Summary ===")
+    print(f"Total vials processed: {processed_count}")
+    print(f"Caps detected: {cap_detection_count} ({cap_detection_count / processed_count * 100:.1f}%)")
+    print("\nState Distribution:")
     for state, count in state_counts.items():
         if count > 0:
             percentage = (count / processed_count) * 100
             print(f"  {state}: {count} ({percentage:.1f}%)")
 
-    print(f"Results saved to: {out_path}")
+    print(f"\nResults saved to: {out_path}")
     return out_path
-
-#
-# def attach_simple_state(manifest_path, liquid_out_dir, out_path=None):
-#     manifest_path = Path(manifest_path)
-#     liquid_out_dir = Path(liquid_out_dir)
-#     labels_dir = liquid_out_dir / "labels"
-#     out_path = Path(out_path) if out_path else manifest_path.parent / "manifest_with_state.jsonl"
-#
-#     with open(manifest_path, "r") as fin, open(out_path, "w") as fout:
-#         for line in fin:
-#             rec = json.loads(line)
-#             crop_path = Path(rec["crop_image"])
-#             label_path = labels_dir / f"{crop_path.stem}.txt"
-#
-#             if not label_path.exists():
-#                 alts = sorted(liquid_out_dir.parent.glob(f"exp*/labels/{crop_path.stem}.txt"))
-#                 if alts:
-#                     label_path = alts[-1]
-#
-#             state_info = decide_air_stable_gel_from_labels(crop_path, label_path)
-#
-#             img = cv2.imread(str(crop_path))
-#             if img is not None:
-#                 v_raw, v_norm = compute_turbidity_profile_v5(img)
-#                 plot_path = save_turbidity_plot_for_crop(crop_path, v_norm)
-#                 state_info.update({
-#                     "turbidity_plot": plot_path,
-#                     "turbidity_mean": float(np.mean(v_norm)),
-#                     "turbidity_maxstep": float(np.max(np.abs(np.diff(v_norm)))) if len(v_norm) > 1 else 0.0
-#                 })
-#
-#             rec.update(state_info)
-#             fout.write(json.dumps(rec) + "\n")
-#     print(f"Wrote: {out_path}")
-#     return out_path
-#
-# def attach_states_to_manifest(manifest_path, labels_dir, out_path=None):
-#     """Read manifest.jsonl, compute state for each crop, and write an updated JSONL."""
-#     labels_dir = Path(labels_dir)
-#     out_path = Path(out_path) if out_path else Path(manifest_path).with_name("manifest_with_state.jsonl")
-#
-#     with open(manifest_path, "r") as fin, open(out_path, "w") as fout:
-#         for line in fin:
-#             rec = json.loads(line)
-#             crop_path = Path(rec["crop_image"])
-#             label_path = labels_dir / "labels" / (crop_path.stem + ".txt")
-#             state_info = decide_state_from_boxes(crop_path, label_path)
-#             rec.update(state_info)  # adds vial_state, num_layers, gel_area_frac, step
-#             fout.write(json.dumps(rec) + "\n")
-#
-#     print(f"Wrote: {out_path}")
-#     return out_path
 
 def parse_args():
     p = argparse.ArgumentParser("Vial → Crop → Liquid")
@@ -873,29 +964,20 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Stage A: Detect vials and create crops
     crops_dir, manifest = run_stage_a_detect_and_crop(args)
+    # Stage B: Run liquid detection (including cap detection)
     liquid_out = run_stage_b_liquid(args, crops_dir)
-    # manifest_with_state = attach_states_to_manifest(
-    #     manifest_path=str(manifest),
-    #     labels_dir=str(liquid_out),
-    #     out_path=None
-    # )
 
     # avoid duplication
     stem = Path(manifest).stem.replace("manifest_", "")
 
-    # classification for 3 states (air, stable, gel)
-    # manifest_with_state = attach_simple_state(
-    #     manifest_path=str(manifest),
-    #     liquid_out_dir=str(liquid_out),
-    #     out_path=str(Path(manifest).with_name(f"manifest_state_{stem}.jsonl"))
-    # )
-
-    # classification for 4 states
-    manifest_with_state = attach_four_state_classification(
+    # classification with cap detection
+    manifest_with_state = attach_manifest(
         manifest_path=str(manifest),
         liquid_out_dir=str(liquid_out),
-        # out_path=str(Path(manifest).with_name(f"manifest_four_state_{stem}.jsonl"))
+        out_path=str(Path(manifest).with_name(f"manifest_full_{stem}.jsonl"))
     )
     # move manifest file
     manifest_dir = Path(liquid_out) / "manifest"
@@ -908,6 +990,82 @@ def main():
     # print(f"Manifest:    {manifest}")
     print(f"Liquid out:  {liquid_out}")
     print(f"With state:  {manifest_with_state}")
+
+    # summary statistics
+    # generate_summary_report(manifest_with_state)
+
+# def generate_summary_report(manifest_path):
+#     """
+#     Generate a summary report of the processing results.
+#     """
+#     summary = {
+#         "total_vials": 0,
+#         "state_counts": {},
+#         "cap_statistics": {
+#             "detected": 0,
+#             "not_detected": 0,
+#             "avg_cap_confidence": [],
+#             "avg_cap_height_fraction": []
+#         },
+#         "turbidity_stats": {
+#             "mean_turbidity": [],
+#             "max_step": []
+#         }
+#     }
+#
+#     with open(manifest_path, "r") as f:
+#         for line in f:
+#             rec = json.loads(line)
+#             summary["total_vials"] += 1
+#
+#             # State counting
+#             state = rec.get("vial_state", "unknown")
+#             summary["state_counts"][state] = summary["state_counts"].get(state, 0) + 1
+#
+#             # Cap statistics
+#             if rec.get("cap_info", {}).get("detected", False):
+#                 summary["cap_statistics"]["detected"] += 1
+#                 summary["cap_statistics"]["avg_cap_confidence"].append(
+#                     rec["cap_info"]["confidence"]
+#                 )
+#                 summary["cap_statistics"]["avg_cap_height_fraction"].append(
+#                     rec["cap_info"]["height_fraction"]
+#                 )
+#             else:
+#                 summary["cap_statistics"]["not_detected"] += 1
+#
+#             # Turbidity statistics
+#             if "turbidity_mean" in rec:
+#                 summary["turbidity_stats"]["mean_turbidity"].append(rec["turbidity_mean"])
+#             if "turbidity_maxstep" in rec:
+#                 summary["turbidity_stats"]["max_step"].append(rec["turbidity_maxstep"])
+#
+#     # Calculate averages
+#     if summary["cap_statistics"]["avg_cap_confidence"]:
+#         summary["cap_statistics"]["avg_cap_confidence"] = np.mean(
+#             summary["cap_statistics"]["avg_cap_confidence"]
+#         )
+#         summary["cap_statistics"]["avg_cap_height_fraction"] = np.mean(
+#             summary["cap_statistics"]["avg_cap_height_fraction"]
+#         )
+#
+#     if summary["turbidity_stats"]["mean_turbidity"]:
+#         summary["turbidity_stats"]["avg_mean_turbidity"] = np.mean(
+#             summary["turbidity_stats"]["mean_turbidity"]
+#         )
+#         summary["turbidity_stats"]["avg_max_step"] = np.mean(
+#             summary["turbidity_stats"]["max_step"]
+#         )
+#         del summary["turbidity_stats"]["mean_turbidity"]
+#         del summary["turbidity_stats"]["max_step"]
+#
+#     # Save summary
+#     summary_path = Path(manifest_path).with_suffix(".summary.json")
+#     with open(summary_path, "w") as f:
+#         json.dump(summary, f, indent=2)
+#
+#     print(f"\nSummary report saved to: {summary_path}")
+#     return summary
 
 if __name__ == "__main__":
     main()
