@@ -34,7 +34,6 @@ def resize_keep_height(img, target_h):
     out = cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_AREA)
     return out, scale
 
-
 def run_stage_a_detect_and_crop(args, manifest_path=None):
     """
     Modified to accept optional manifest path parameter.
@@ -193,48 +192,102 @@ def box_area(b):
     x1,y1,x2,y2 = b
     return max(0, x2-x1) * max(0, y2-y1)
 
+def iou_xyxy(a, b):
+    ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    ua = max(0, ax2 - ax1) * max(0, ay2 - ay1) + max(0, bx2 - bx1) * max(0, by2 - by1) - inter
+    return inter / (ua + 1e-9)
+
+def merge_by_iou_desc_conf(dets, iou_thr=0.5):
+    """
+    Greedy merge: sort by confidence desc; keep a det only if it doesn't
+    overlap (IoU>thr) with any already kept det.
+    dets: list of dicts with keys 'box' and 'confidence'.
+    """
+    if not dets:
+        return dets
+    dets = sorted(dets, key=lambda d: d['confidence'], reverse=True)
+    kept = []
+    for d in dets:
+        bb = d['box']
+        if all(iou_xyxy(bb, k['box']) <= iou_thr for k in kept):
+            kept.append(d)
+    return kept
+
 # ---- State classification ---- #
 
-def detect_phase_separation_from_turbidity(img):
+def detect_phase_separation_logic(detections, vial_height, vial_width, cap_bottom_y=None,
+                                  conf_min=0.30, min_area_frac=0.002,
+                                  iou_merge_thr=0.5, gap_thr=0.03, span_thr=0.20):
+    # total vial area
+    total_area = float(vial_height) * float(vial_width)
+
+    # pre-filter
+    liquid = []
+    for d in detections:
+        if not is_liquid_cls(d['class_id']):
+            continue
+        if d['confidence'] < conf_min:
+            continue
+        if cap_bottom_y is not None and d['box'][1] <= cap_bottom_y:
+            continue
+        if (d['area'] / max(1e-6, total_area)) < min_area_frac:
+            continue
+        liquid.append(d)
+    if len(liquid) < 2:
+        return False
+
+    # 1. merge duplicates
+    liquid = merge_by_iou_desc_conf(liquid, iou_thr=iou_merge_thr)
+    if len(liquid) < 2:
+        return False
+
+    # 2. sort once
+    liquid.sort(key=lambda x: x['center_y'])
+
+    # 3. gap test
+    for i in range(len(liquid)-1):
+        current_bottom = liquid[i]['box'][3]
+        next_top       = liquid[i+1]['box'][1]
+        gap = (next_top - current_bottom) / float(vial_height)
+        if gap >= gap_thr:
+            return True
+
+    # 4. span test
+    span = (liquid[-1]['center_y'] - liquid[0]['center_y']) / float(vial_height)
+    return span >= span_thr
+
+def enhanced_detect_phase_separation_from_turbidity(img, cap_bottom_y=None):
     """
-    Detect phase separation from turbidity profile analysis.
-    Excludes top/bottom regions to avoid meniscus and vial artifacts.
+    Detect phase separation with cap-aware region exclusion.
     """
     try:
-        # Calculate turbidity profile
-        v_raw, v_norm = compute_turbidity_profile_v5(img)
+        # Compute turbidity with intelligent exclusion
+        v_raw, v_norm, excluded_info = compute_turbidity_profile_with_exclusion(
+            img, cap_bottom_y
+        )
 
-        # Define exclude regions
-        top_exclude = 0.25
-        bottom_exclude = 0.05
-
-        # Calculate indices for analysis region
-        total_length = len(v_norm)
-        start_idx = int(total_length * top_exclude)
-        end_idx = int(total_length * (1 - bottom_exclude))
-
-        # Extract only the middle region for analysis
-        middle_region = v_norm[start_idx:end_idx]
-
-        if len(middle_region) < 50:  # minimum profile length
+        if len(v_norm) < 50:  # Minimum profile length
             return False
 
         # Calculate gradient only in the analysis region
-        gradient = np.abs(np.gradient(middle_region))
+        gradient = np.abs(np.gradient(v_norm))
 
-        # conservative threshold for the cleaned region
-        threshold = np.mean(gradient) + 2.5 * np.std(gradient)
-        threshold = max(threshold, 0.06)
+        # Conservative threshold
+        threshold = max(np.mean(gradient) + 2.5 * np.std(gradient), 0.10)
 
         # Find significant peaks
         significant_peaks = gradient > threshold
         peak_positions = np.where(significant_peaks)[0]
 
-        if len(peak_positions) < 3:
+        if len(peak_positions) == 0:
             return False
 
-        # Group nearby peaks (within % of analysis region length)
-        min_separation = len(middle_region) * 0.08
+        # group peaks if they’re close
+        min_separation = int(len(v_norm) * 0.1)
         peak_groups = []
         current_group = [peak_positions[0]]
 
@@ -246,92 +299,18 @@ def detect_phase_separation_from_turbidity(img):
                 current_group = [peak_positions[i]]
         peak_groups.append(current_group)
 
-        # substantial peak groups requirement
-        substantial_groups = [group for group in peak_groups if len(group) >= 2]
-        return len(substantial_groups) >= 2
+        # collapse each group to one peak
+        merged_peaks = [g[np.argmax(gradient[g])] for g in peak_groups]
+
+        # merged_peaks for classification
+        if len(merged_peaks) < 2:
+            return False
+
+        return True
 
     except Exception as e:
         print(f"Turbidity analysis failed: {e}")
         return False
-
-def detect_phase_separation_logic(detections, vial_height):
-    """
-    Detect phase separation based on:
-    1. Multiple separated liquid regions (even same class)
-    2. Vertical distribution patterns
-    3. Air gaps between liquid regions
-    """
-    if len(detections) < 2:
-        return False
-
-    # Filter to only liquid detections
-    liquid_detections = [d for d in detections if is_liquid_cls(d['class_id'])]
-    if len(liquid_detections) < 2:
-        return False
-
-    # Sort liquid detections by vertical position (top to bottom)
-    liquid_detections.sort(key=lambda x: x['center_y'])
-
-    # Case 1: Check for vertically separated liquid regions (regardless of class)
-    vertical_gaps = []
-    for i in range(len(liquid_detections) - 1):
-        current_bottom = liquid_detections[i]['box'][3]  # y2 coordinate
-        next_top = liquid_detections[i + 1]['box'][1]  # y1 coordinate
-        gap = (next_top - current_bottom) / vial_height  # Normalize gap
-        vertical_gaps.append(gap)
-
-    # If there is a gap between liquid regions
-    max_gap = max(vertical_gaps) if vertical_gaps else 0
-    if max_gap > 0.01:  # % of vial height gap between liquids
-        return True
-
-    # Case 2: Check for different liquid classes at different heights
-    class_groups = {}
-    for det in liquid_detections:
-        cid = det['class_id']
-        if cid not in class_groups:
-            class_groups[cid] = []
-        class_groups[cid].append(det['center_y'] / vial_height)
-
-    if len(class_groups) >= 2:
-        # Calculate average vertical position for each class
-        class_centers = {}
-        for cid, positions in class_groups.items():
-            class_centers[cid] = np.mean(positions)
-
-        # Check if classes are vertically separated
-        centers = list(class_centers.values())
-        max_separation = max(centers) - min(centers)
-
-        if max_separation > PHASE_LAYER_MIN_GAP:
-            return True
-
-    # Case 3: Check for multiple liquid regions vertically stacked
-    if len(liquid_detections) >= 2:
-        # Sort by vertical position
-        liquid_sorted = sorted(liquid_detections, key=lambda x: x['center_y'])
-
-        # Check vertical separation between liquid regions
-        for i in range(len(liquid_sorted) - 1):
-            current_region = liquid_sorted[i]
-            next_region = liquid_sorted[i + 1]
-
-            # Calculate gap between bottom of current and top of next
-            current_bottom = current_region['box'][3]  # y2
-            next_top = next_region['box'][1]  # y1
-            gap = (next_top - current_bottom) / vial_height
-
-            # very small threshold
-            if gap > 0.001:
-                return True
-
-        # case of multiple liquid detections spread over large vertical distance even without gaps
-        # (overlapping but distinct regions)
-        liquid_span = (liquid_sorted[-1]['center_y'] - liquid_sorted[0]['center_y']) / vial_height
-        if liquid_span > 0.15:  # % of vial height
-            return True
-
-    return False
 
 def analyze_phase_separation(detections, vial_height):
     """
@@ -382,45 +361,62 @@ def analyze_phase_separation(detections, vial_height):
         'layers': layer_analysis
     }
 
-def calculate_classification_confidence(detections):
-    """
-    Calculate confidence in the classification based on detection quality.
-    """
-    if not detections:
-        return 0.0
+# def calculate_classification_confidence(detections):
+#     """
+#     Calculate confidence in the classification based on detection quality.
+#     """
+#     if not detections:
+#         return 0.0
+#
+#     # Average detection confidence
+#     avg_conf = np.mean([d['confidence'] for d in detections])
+#
+#     # Number of detections
+#     detection_score = min(len(detections) / 5.0, 1.0)  # Normalize to max of 5 detections
+#
+#     # Combine metrics
+#     overall_confidence = (avg_conf * 0.7) + (detection_score * 0.3)
+#
+#     return float(overall_confidence)
 
-    # Average detection confidence
-    avg_conf = np.mean([d['confidence'] for d in detections])
-
-    # Number of detections
-    detection_score = min(len(detections) / 5.0, 1.0)  # Normalize to max of 5 detections
-
-    # Combine metrics
-    overall_confidence = (avg_conf * 0.7) + (detection_score * 0.3)
-
-    return float(overall_confidence)
-
-def calculate_liquid_volumes(detections, vial_height, vial_width, vial_volume_ml=1.8):
+def calculate_liquid_volumes(detections, vial_height, vial_width,
+                             vial_volume_ml=1, cap_bottom_y=None):
     """
     Estimate liquid volumes from bounding box detections.
-    Assumes cylindrical vial geometry.
+    If cap_bottom_y is given, only include liquid below the cap.
+
+    Args:
+        detections: list of detection dicts (with 'class_id', 'box', 'area')
+        vial_height: total vial height in pixels
+        vial_width: total vial width in pixels
+        vial_volume_ml: nominal vial volume (mL)
+        cap_bottom_y: if not None, exclude liquid above this y-coordinate
     """
     volumes = {}
-    total_vial_area = vial_height * vial_width
+    # Adjust effective height if cap detected
+    effective_height = vial_height
+    if cap_bottom_y is not None:
+        effective_height = vial_height - cap_bottom_y
 
-    for detection in detections:
-        if is_liquid_cls(detection['class_id']):
-            # Calculate volume fraction based on area
-            area_fraction = detection['area'] / total_vial_area
+    total_vial_area = effective_height * vial_width
+    if total_vial_area <= 0:
+        return {"gel": 0.0, "stable": 0.0}
+
+    for det in detections:
+        if is_liquid_cls(det['class_id']):
+            y1 = det['box'][1]
+            # Exclude liquid above cap if cap_bottom_y is set
+            if cap_bottom_y is not None and y1 <= cap_bottom_y:
+                continue
+
+            # Calculate volume fraction
+            area_fraction = det['area'] / total_vial_area
             volume_ml = area_fraction * vial_volume_ml
 
-            class_name = 'gel' if detection['class_id'] == GEL_ID else 'stable'
-            if class_name not in volumes:
-                volumes[class_name] = 0.0
-            volumes[class_name] += volume_ml
+            class_name = "gel" if det['class_id'] == GEL_ID else "stable"
+            volumes[class_name] = volumes.get(class_name, 0.0) + volume_ml
 
     return volumes
-
 
 def detect_cap_region(detections, img_height):
     """
@@ -455,78 +451,13 @@ def detect_cap_region(detections, img_height):
 
     return primary_cap['box'][3], cap_info
 
-
-def compute_turbidity_profile_with_exclusion(crop_bgr, cap_bottom_y=None,
-                                             top_exclude_fraction=0.15,
-                                             bottom_exclude_fraction=0.05):
-    """
-    Compute turbidity profile with intelligent region exclusion.
-
-    Args:
-        crop_bgr: BGR image of the crop
-        cap_bottom_y: Y-coordinate of cap bottom (if detected)
-        top_exclude_fraction: Default fraction to exclude from top if no cap
-        bottom_exclude_fraction: Fraction to exclude from bottom
-
-    Returns:
-        tuple: (v_raw, v_norm, excluded_regions_info)
-    """
-    # Resize to standard size for analysis
-    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    h_original, w_original = crop_bgr.shape[:2]
-
-    # Standard analysis size
-    analysis_width = 100
-    analysis_height = 500
-    turb = cv2.resize(crop_rgb, (analysis_width, analysis_height))
-
-    # Convert to HSV and extract Value channel
-    hsv = cv2.cvtColor(turb, cv2.COLOR_RGB2HSV)
-    v_full = np.mean(hsv[:, :, -1], axis=-1)  # (500,)
-
-    # Calculate exclusion regions
-    if cap_bottom_y is not None:
-        # Scale cap position to analysis dimensions
-        cap_bottom_scaled = int((cap_bottom_y / h_original) * analysis_height)
-        # Add small buffer below cap
-        top_exclude_idx = min(cap_bottom_scaled + 10, analysis_height // 3)
-    else:
-        # Use default top exclusion
-        top_exclude_idx = int(analysis_height * top_exclude_fraction)
-
-    # Bottom exclusion (vial bottom artifacts)
-    bottom_exclude_idx = int(analysis_height * (1 - bottom_exclude_fraction))
-
-    # Extract analysis region
-    v_analysis = v_full[top_exclude_idx:bottom_exclude_idx]
-
-    # Normalize the analysis region
-    if len(v_analysis) > 0:
-        v_norm = (v_analysis - v_analysis.min()) / max(1e-6, (v_analysis.max() - v_analysis.min()))
-    else:
-        v_norm = np.array([])
-
-    # Create full profile with excluded regions marked
-    v_full_norm = np.zeros_like(v_full)
-    if len(v_norm) > 0:
-        v_full_norm[top_exclude_idx:bottom_exclude_idx] = v_norm
-
-    excluded_info = {
-        'top_exclude_idx': top_exclude_idx,
-        'bottom_exclude_idx': bottom_exclude_idx,
-        'analysis_height': analysis_height,
-        'excluded_top_fraction': top_exclude_idx / analysis_height,
-        'excluded_bottom_fraction': (analysis_height - bottom_exclude_idx) / analysis_height,
-        'cap_detected': cap_bottom_y is not None
-    }
-
-    return v_full, v_full_norm, excluded_info
-
-
 def enhanced_decide(crop_path: Path, label_path: Path):
     """
     Enhanced four-state classification with cap detection integration.
     """
+    # Usage of turbidity analysis for phase separation
+    use_turbidity_decide = False
+
     img = cv2.imread(str(crop_path))
     if img is None:
         return {"vial_state": "unknown", "reason": "crop_not_found"}
@@ -630,13 +561,14 @@ def enhanced_decide(crop_path: Path, label_path: Path):
         return result
 
     # Check for phase separation
-    is_phase_separated = detect_phase_separation_logic(detections, H)
+    is_phase_separated = detect_phase_separation_logic(detections, H, W, cap_bottom_y)
 
-    # Enhanced turbidity analysis with cap exclusion
-    if not is_phase_separated and img is not None:
-        is_phase_separated = enhanced_detect_phase_separation_from_turbidity(
-            img, cap_bottom_y
-        )
+    if use_turbidity_decide:
+        # turbidity analysis with cap exclusion
+        if not is_phase_separated and img is not None:
+            is_phase_separated = enhanced_detect_phase_separation_from_turbidity(
+                img, cap_bottom_y
+            )
 
     if is_phase_separated:
         result = {
@@ -663,10 +595,7 @@ def enhanced_decide(crop_path: Path, label_path: Path):
     # Calculate liquid volume below cap
     if cap_bottom_y:
         # Adjust volume calculation to exclude cap region
-        effective_height = H - cap_bottom_y
-        volume_estimates = calculate_liquid_volumes_with_exclusion(
-            detections, effective_height, W, cap_bottom_y
-        )
+        volume_estimates = calculate_liquid_volumes(detections, vial_height=H, vial_width=W, cap_bottom_y=cap_bottom_y)
     else:
         volume_estimates = calculate_liquid_volumes(detections, H, W)
 
@@ -684,58 +613,63 @@ def enhanced_decide(crop_path: Path, label_path: Path):
 
     return result
 
-
-def enhanced_detect_phase_separation_from_turbidity(img, cap_bottom_y=None):
-    """
-    Detect phase separation with cap-aware region exclusion.
-    """
-    try:
-        # Compute turbidity with intelligent exclusion
-        v_raw, v_norm, excluded_info = compute_turbidity_profile_with_exclusion(
-            img, cap_bottom_y
-        )
-
-        if len(v_norm) < 50:  # Minimum profile length
-            return False
-
-        # Calculate gradient only in the analysis region
-        gradient = np.abs(np.gradient(v_norm))
-
-        # Conservative threshold
-        threshold = np.mean(gradient) + 2.5 * np.std(gradient)
-        threshold = max(threshold, 0.06)
-
-        # Find significant peaks
-        significant_peaks = gradient > threshold
-        peak_positions = np.where(significant_peaks)[0]
-
-        if len(peak_positions) < 3:
-            return False
-
-        # Group nearby peaks
-        min_separation = len(v_norm) * 0.08
-        peak_groups = []
-        current_group = [peak_positions[0]]
-
-        for i in range(1, len(peak_positions)):
-            if peak_positions[i] - peak_positions[i - 1] < min_separation:
-                current_group.append(peak_positions[i])
-            else:
-                peak_groups.append(current_group)
-                current_group = [peak_positions[i]]
-        peak_groups.append(current_group)
-
-        # Require substantial peak groups
-        substantial_groups = [group for group in peak_groups if len(group) >= 2]
-        return len(substantial_groups) >= 2
-
-    except Exception as e:
-        print(f"Turbidity analysis failed: {e}")
-        return False
-
+# def detect_phase_separation_from_turbidity(img, cap_bottom_y=None,
+#                                            top_exclude=0.25,
+#                                            bottom_exclude=0.05):
+#     """
+#     Detect phase separation from turbidity profile analysis.
+#     Uses cap-aware exclusion if available.
+#     """
+#     try:
+#         # Get turbidity profile with exclusions
+#         v_full, v_full_norm, excluded_info = compute_turbidity_profile_with_exclusion(
+#             img,
+#             cap_bottom_y=cap_bottom_y,
+#             top_exclude_fraction=top_exclude,
+#             bottom_exclude_fraction=bottom_exclude
+#         )
+#
+#         # Extract only the nonzero analysis region
+#         middle_region = v_full_norm[np.nonzero(v_full_norm)]
+#
+#         if len(middle_region) < 50:  # minimum profile length
+#             return False
+#
+#         # Gradient analysis
+#         gradient = np.abs(np.gradient(middle_region))
+#         threshold = np.mean(gradient) + 2.5 * np.std(gradient)
+#         threshold = max(threshold, 0.06)
+#
+#         # Peak detection
+#         significant_peaks = gradient > threshold
+#         peak_positions = np.where(significant_peaks)[0]
+#
+#         if len(peak_positions) < 3:
+#             return False
+#
+#         # Group nearby peaks (within % of analysis region length)
+#         min_separation = len(middle_region) * 0.08
+#         peak_groups = []
+#         current_group = [peak_positions[0]]
+#
+#         for i in range(1, len(peak_positions)):
+#             if peak_positions[i] - peak_positions[i - 1] < min_separation:
+#                 current_group.append(peak_positions[i])
+#             else:
+#                 peak_groups.append(current_group)
+#                 current_group = [peak_positions[i]]
+#         peak_groups.append(current_group)
+#
+#         # Require ≥2 substantial groups of peaks
+#         substantial_groups = [g for g in peak_groups if len(g) >= 2]
+#         return len(substantial_groups) >= 2
+#
+#     except Exception as e:
+#         print(f"Turbidity analysis failed: {e}")
+#         return False
 
 def calculate_liquid_volumes_with_exclusion(detections, effective_height, vial_width,
-                                            cap_bottom_y, vial_volume_ml=1.8):
+                                            cap_bottom_y, vial_volume_ml=1):
     """
     Calculate liquid volumes excluding cap region.
     """
@@ -760,11 +694,100 @@ def calculate_liquid_volumes_with_exclusion(detections, effective_height, vial_w
     return volumes
 
 
-def save_enhanced_turbidity_plot(path, v_norm, excluded_info, dir=None):
-    """
-    Save turbidity plot with excluded regions visualization.
-    """
+# ---- Turbidity Analysis ---- #
 
+def compute_turbidity_profile_with_exclusion(crop_bgr, cap_bottom_y=None,
+                                             top_exclude_fraction=0.25,
+                                             bottom_exclude_fraction=0.05):
+    """
+    Compute turbidity profile with intelligent region exclusion.
+
+    Args:
+        crop_bgr: BGR image of the crop
+        cap_bottom_y: Y-coordinate of cap bottom (if detected)
+        top_exclude_fraction: Default fraction to exclude from top if no cap
+        bottom_exclude_fraction: Fraction to exclude from bottom
+
+    Returns:
+        tuple: (v_raw, v_norm, excluded_regions_info)
+    """
+    # Resize to standard size for analysis
+    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    h_original, w_original = crop_bgr.shape[:2]
+
+    # Standard analysis size
+    analysis_width = 100
+    analysis_height = 500
+    turb = cv2.resize(crop_rgb, (analysis_width, analysis_height))
+
+    # Convert to HSV and extract Value channel
+    hsv = cv2.cvtColor(turb, cv2.COLOR_RGB2HSV)
+    v_full = np.mean(hsv[:, :, -1], axis=-1)  # (500,)
+
+    # Calculate exclusion regions
+    if cap_bottom_y is not None:
+        # Scale cap position to analysis dimensions
+        cap_bottom_scaled = int((cap_bottom_y / h_original) * analysis_height)
+        # Add small buffer below cap
+        top_exclude_idx = min(cap_bottom_scaled + 10, analysis_height // 3)
+    else:
+        # Use default top exclusion
+        top_exclude_idx = int(analysis_height * top_exclude_fraction)
+
+    # Bottom exclusion (vial bottom artifacts)
+    bottom_exclude_idx = int(analysis_height * (1 - bottom_exclude_fraction))
+
+    # Extract analysis region
+    v_analysis = v_full[top_exclude_idx:bottom_exclude_idx]
+
+    # Normalize the analysis region
+    if len(v_analysis) > 0:
+        v_norm = (v_analysis - v_analysis.min()) / max(1e-6, (v_analysis.max() - v_analysis.min()))
+    else:
+        v_norm = np.array([])
+
+    # Create full profile with excluded regions marked
+    v_full_norm = np.zeros_like(v_full)
+    if len(v_norm) > 0:
+        v_full_norm[top_exclude_idx:bottom_exclude_idx] = v_norm
+
+    excluded_info = {
+        'top_exclude_idx': top_exclude_idx,
+        'bottom_exclude_idx': bottom_exclude_idx,
+        'analysis_height': analysis_height,
+        'excluded_top_fraction': top_exclude_idx / analysis_height,
+        'excluded_bottom_fraction': (analysis_height - bottom_exclude_idx) / analysis_height,
+        'cap_detected': cap_bottom_y is not None
+    }
+
+    return v_full, v_full_norm, excluded_info
+
+# def save_turbidity_plot(path, v_norm, dir=None):
+#     z = np.linspace(0, 1, len(v_norm))
+#     if dir is not None:
+#         filename = Path(path).stem + ".turbidity.png"
+#         out_path = dir / filename
+#     else:
+#         out_path = Path(path).with_suffix(".turbidity.png")
+#
+#     plt.figure(figsize=(3.0, 4.0), dpi=120)
+#     plt.plot(v_norm, z)
+#     plt.gca().invert_yaxis()
+#     plt.xlabel("Turbidity (norm)"); plt.ylabel("Normalized Height")
+#     plt.title(Path(path).name, fontsize=8)
+#     plt.tight_layout(); plt.savefig(out_path); plt.close()
+#     return str(out_path)
+
+# def compute_turbidity_profile(crop_bgr):
+#     # Resize to (100, 500), HSV->V, mean over width
+#     crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+#     turb = cv2.resize(crop_rgb, (100, 500))
+#     hsv = cv2.cvtColor(turb, cv2.COLOR_RGB2HSV)
+#     v = np.mean(hsv[:, :, -1], axis=-1)  # (500,)
+#     v_norm = (v - v.min()) / max(1e-6, (v.max() - v.min()))
+#     return v, v_norm
+
+def save_enhanced_turbidity_plot(path, v_norm, excluded_info, dir=None):
     z = np.linspace(0, 1, len(v_norm))
 
     if dir is not None:
@@ -775,80 +798,55 @@ def save_enhanced_turbidity_plot(path, v_norm, excluded_info, dir=None):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(6, 4), dpi=120)
 
-    # Plot 1: Turbidity profile with excluded regions
+    # Plot 1: Turbidity profile
     ax1.plot(v_norm, z, 'b-', linewidth=2)
-
-    # Mark excluded regions
     if excluded_info:
-        top_exc = excluded_info['excluded_top_fraction']
-        bottom_exc = excluded_info['excluded_bottom_fraction']
-
-        # Shade excluded regions
-        ax1.axhspan(0, top_exc, alpha=0.2, color='red', label='Excluded (top)')
-        ax1.axhspan(1 - bottom_exc, 1, alpha=0.2, color='orange', label='Excluded (bottom)')
-
+        ax1.axhspan(0, excluded_info['excluded_top_fraction'], alpha=0.2, color='red')
+        ax1.axhspan(1 - excluded_info['excluded_bottom_fraction'], 1, alpha=0.2, color='orange')
     ax1.invert_yaxis()
     ax1.set_xlabel("Turbidity (normalized)")
     ax1.set_ylabel("Normalized Height")
     ax1.set_title("Turbidity Profile", fontsize=10)
-    ax1.legend(loc='best', fontsize=8)
-    ax1.grid(True, alpha=0.3)
 
     # Plot 2: Gradient analysis
-    if len(v_norm) > 1:
-        gradient = np.abs(np.gradient(v_norm))
-        z_grad = np.linspace(0, 1, len(gradient))
-        ax2.plot(gradient, z_grad, 'g-', linewidth=2)
+    gradient = np.abs(np.gradient(v_norm))
+    z_grad = np.linspace(0, 1, len(gradient))
+    ax2.plot(gradient, z_grad, 'g-', linewidth=2)
 
-        # Mark significant peaks
-        threshold = np.mean(gradient) + 2.5 * np.std(gradient)
-        peaks = gradient > threshold
-        if np.any(peaks):
-            ax2.scatter(gradient[peaks], z_grad[peaks], c='red', s=20,
-                        label='Significant peaks', zorder=5)
+    threshold = max(np.mean(gradient) + 2.5*np.std(gradient), 0.06)
+    ax2.axvline(threshold, color='r', linestyle='--', alpha=0.5)
 
-        ax2.axvline(threshold, color='r', linestyle='--', alpha=0.5,
-                    label=f'Threshold: {threshold:.3f}')
+    # --- peak grouping ---
+    peak_positions = np.where(gradient > threshold)[0]
+    if len(peak_positions) > 0:
+        min_sep = int(len(v_norm) * 0.1)
+        groups = []
+        current = [peak_positions[0]]
+        for i in range(1, len(peak_positions)):
+            if peak_positions[i] - peak_positions[i-1] < min_sep:
+                current.append(peak_positions[i])
+            else:
+                groups.append(current)
+                current = [peak_positions[i]]
+        groups.append(current)
+
+        # pick the strongest peak from each group
+        merged_peaks = [g[np.argmax(gradient[g])] for g in groups]
+
+        # Scatter only merged peaks
+        ax2.scatter(gradient[merged_peaks], z_grad[merged_peaks],
+                    c='red', s=25, label='Significant peaks')
 
     ax2.invert_yaxis()
     ax2.set_xlabel("Gradient Magnitude")
     ax2.set_ylabel("Normalized Height")
     ax2.set_title("Gradient Analysis", fontsize=10)
-    ax2.legend(loc='best', fontsize=8)
-    ax2.grid(True, alpha=0.3)
 
     plt.suptitle(Path(path).name, fontsize=9)
     plt.tight_layout()
     plt.savefig(out_path, bbox_inches='tight')
     plt.close()
 
-    return str(out_path)
-
-# ---- Turbidity Analysis ---- #
-
-def compute_turbidity_profile_v5(crop_bgr):
-    # Resize to (100, 500), HSV->V, mean over width
-    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    turb = cv2.resize(crop_rgb, (100, 500))
-    hsv = cv2.cvtColor(turb, cv2.COLOR_RGB2HSV)
-    v = np.mean(hsv[:, :, -1], axis=-1)  # (500,)
-    v_norm = (v - v.min()) / max(1e-6, (v.max() - v.min()))
-    return v, v_norm
-
-def save_turbidity_plot(path, v_norm, dir=None):
-    z = np.linspace(0, 1, len(v_norm))
-    if dir is not None:
-        filename = Path(path).stem + ".turbidity.png"
-        out_path = dir / filename
-    else:
-        out_path = Path(path).with_suffix(".turbidity.png")
-
-    plt.figure(figsize=(3.0, 4.0), dpi=120)
-    plt.plot(v_norm, z)
-    plt.gca().invert_yaxis()
-    plt.xlabel("Turbidity (norm)"); plt.ylabel("Normalized Height")
-    plt.title(Path(path).name, fontsize=8)
-    plt.tight_layout(); plt.savefig(out_path); plt.close()
     return str(out_path)
 
 # ---- Manifest files ---- #
