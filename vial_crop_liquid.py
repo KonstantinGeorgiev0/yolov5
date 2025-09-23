@@ -882,6 +882,164 @@ def save_enhanced_turbidity_plot(path, v_norm, excluded_info, dir=None):
 
     return str(out_path)
 
+def extract_detection_regions(crop_path, label_path, min_conf=0.20):
+    """
+    Extract detection regions from crop image based on YOLO labels.
+
+    Args:
+        crop_path: Path to the crop image
+        label_path: Path to the corresponding YOLO label file
+        min_conf: Minimum confidence threshold for detections
+
+    Returns:
+        List of detection region dictionaries with image data and metadata
+    """
+    img = cv2.imread(str(crop_path))
+    if img is None:
+        return []
+
+    H, W = img.shape[:2]
+    regions = []
+
+    if not label_path.exists():
+        return regions
+
+    with open(label_path) as f:
+        for i, raw in enumerate(f):
+            raw = raw.strip()
+            if not raw:
+                continue
+
+            parsed = yolo_line_to_xyxy(raw, W, H)
+            if not parsed:
+                continue
+
+            cid, box, conf = parsed
+            if conf < min_conf:
+                continue
+
+            # Extract region from image
+            x1, y1, x2, y2 = map(int, box)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(W - 1, x2), min(H - 1, y2)
+
+            region_img = img[y1:y2, x1:x2].copy()
+
+            # Skip very small regions
+            if region_img.shape[0] < 10 or region_img.shape[1] < 10:
+                continue
+
+            # Determine class name
+            class_names = {0: "gel", 1: "stable", 2: "air", 3: "cap"}
+            class_name = class_names.get(cid, f"class_{cid}")
+
+            region_info = {
+                'region_id': i,
+                'class_id': cid,
+                'class_name': class_name,
+                'confidence': conf,
+                'bbox': [x1, y1, x2, y2],
+                'region_img': region_img,
+                'region_size': (x2 - x1, y2 - y1),
+                'is_liquid': is_liquid_cls(cid)
+            }
+            regions.append(region_info)
+
+    return regions
+
+def create_region_turbidity_plots(crop_path, regions, output_dir):
+    """
+    Create turbidity plots for all detection regions in a crop.
+
+    Args:
+        crop_path: Path to the original crop image
+        regions: List of region dictionaries from extract_detection_regions
+        output_dir: Directory to save turbidity plots
+
+    Returns:
+        List of created plot paths
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_paths = []
+    crop_stem = Path(crop_path).stem
+
+    for region in regions:
+        region_img = region['region_img']
+
+        # Compute turbidity profile for this region
+        v_norm = compute_turbidity_profile(region_img)
+
+        # Create unique filename for this region
+        region_suffix = f"_region{region['region_id']:02d}_{region['class_name']}_conf{region['confidence']:.2f}"
+
+        # Save turbidity plot using existing function
+        plot_path = save_turbidity_plot(
+            crop_path,
+            v_norm,
+            dir=output_dir,
+            suffix=region_suffix
+        )
+
+        plot_paths.append({
+            'region_info': region,
+            'plot_path': plot_path,
+            'turbidity_stats': {
+                'mean': float(np.mean(v_norm)),
+                'std': float(np.std(v_norm)),
+                'max_gradient': float(np.max(np.abs(np.diff(v_norm)))) if len(v_norm) > 1 else 0.0
+            }
+        })
+
+    return plot_paths
+
+def create_region_turbidity_summary(manifest_path, output_dir):
+    """
+    Create a summary visualization of all region turbidity analyses.
+    """
+    output_dir = Path(output_dir)
+
+    # Read manifest and collect region data
+    region_data = {'gel': [], 'stable': [], 'air': [], 'cap': []}
+
+    with open(manifest_path, 'r') as f:
+        for line in f:
+            record = json.loads(line.strip())
+            for region in record.get('detection_regions', []):
+                class_name = region['class_name']
+                if class_name in region_data:
+                    region_data[class_name].append(region['turbidity_stats'])
+
+    # Create summary plots
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle('Region Turbidity Analysis Summary', fontsize=14)
+
+    for idx, (class_name, data) in enumerate(region_data.items()):
+        if not data:
+            continue
+
+        ax = axes[idx // 2, idx % 2]
+        means = [d['mean'] for d in data]
+        max_grads = [d['max_gradient'] for d in data]
+
+        ax.scatter(means, max_grads, alpha=0.6, label=f'{class_name} (n={len(data)})')
+        ax.set_xlabel('Mean Turbidity')
+        ax.set_ylabel('Max Gradient')
+        ax.set_title(f'{class_name.title()} Regions')
+        ax.legend()
+
+    # Remove empty subplots
+    for idx in range(len(region_data), 4):
+        axes[idx // 2, idx % 2].set_visible(False)
+
+    plt.tight_layout()
+    summary_path = output_dir / 'region_turbidity_summary.png'
+    plt.savefig(summary_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return str(summary_path)
+
 # ---- Manifest files ---- #
 
 def process_and_save_manifest(crop_records, liquid_out_dir, final_manifest_path):
