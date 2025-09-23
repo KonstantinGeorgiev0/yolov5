@@ -1045,6 +1045,7 @@ def create_region_turbidity_summary(manifest_path, output_dir):
 def process_and_save_manifest(crop_records, liquid_out_dir, final_manifest_path):
     """
     Process all crop records and create final manifest with all information.
+    Include region-wise turbidity analysis.
     """
     liquid_out_dir = Path(liquid_out_dir)
     labels_dir = liquid_out_dir / "labels"
@@ -1059,8 +1060,12 @@ def process_and_save_manifest(crop_records, liquid_out_dir, final_manifest_path)
     }
     cap_detection_count = 0
 
-    # Ensure output directory exists
+    # Create directories
     final_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    turbidity_dir = liquid_out_dir / "turbidity"
+    region_turbidity_dir = liquid_out_dir / "region_turbidity"  # New directory for region plots
+    turbidity_dir.mkdir(parents=True, exist_ok=True)
+    region_turbidity_dir.mkdir(parents=True, exist_ok=True)
 
     with open(final_manifest_path, "w") as fout:
         for rec in crop_records:
@@ -1080,13 +1085,30 @@ def process_and_save_manifest(crop_records, liquid_out_dir, final_manifest_path)
             if state_info.get("cap_info", {}).get("detected", False):
                 cap_detection_count += 1
 
+            # Extract detection regions and create region-wise turbidity plots
+            regions = extract_detection_regions(crop_path, label_path)
+            region_plots = create_region_turbidity_plots(crop_path, regions, region_turbidity_dir)
+
+            # Add region analysis to state info
+            state_info.update({
+                'detection_regions': [{
+                    'region_id': r['region_info']['region_id'],
+                    'class_name': r['region_info']['class_name'],
+                    'class_id': r['region_info']['class_id'],
+                    'confidence': r['region_info']['confidence'],
+                    'bbox': r['region_info']['bbox'],
+                    'region_size': r['region_info']['region_size'],
+                    'is_liquid': r['region_info']['is_liquid'],
+                    'turbidity_plot': r['plot_path'],
+                    'turbidity_stats': r['turbidity_stats']
+                } for r in region_plots],
+                'num_detection_regions': len(regions),
+                'num_liquid_regions': sum(1 for r in regions if r['is_liquid'])
+            })
+
             # Enhanced turbidity analysis
             img = cv2.imread(str(crop_path))
             if img is not None:
-                # Create turbidity directory
-                turbidity_dir = liquid_out_dir / "turbidity"
-                turbidity_dir.mkdir(parents=True, exist_ok=True)
-
                 # Extract cap info for turbidity analysis
                 cap_bottom_y = None
                 if state_info.get("cap_info", {}).get("detected", False):
@@ -1102,8 +1124,13 @@ def process_and_save_manifest(crop_records, liquid_out_dir, final_manifest_path)
                     crop_path, v_norm, excluded_info, turbidity_dir
                 )
 
+                region_plot_path = save_turbidity_plot(
+                    crop_path, v_norm, turbidity_dir
+                )
+
                 state_info.update({
                     "turbidity_plot": plot_path,
+                    "region_turbidity_plot": region_plot_path,
                     "turbidity_mean": float(np.mean(v_norm)) if len(v_norm) > 0 else 0.0,
                     "turbidity_maxstep": float(np.max(np.abs(np.diff(v_norm)))) if len(v_norm) > 1 else 0.0,
                     "turbidity_excluded_regions": excluded_info
@@ -1117,7 +1144,7 @@ def process_and_save_manifest(crop_records, liquid_out_dir, final_manifest_path)
             state_counts[state] = state_counts.get(state, 0) + 1
             processed_count += 1
 
-    # Print summary
+    # summary
     print(f"\n=== Processing Summary ===")
     print(f"Total vials processed: {processed_count}")
     print(f"Caps detected: {cap_detection_count} ({cap_detection_count / processed_count * 100:.1f}%)")
@@ -1128,6 +1155,7 @@ def process_and_save_manifest(crop_records, liquid_out_dir, final_manifest_path)
             print(f"  {state}: {count} ({percentage:.1f}%)")
 
     print(f"\nManifest saved to: {final_manifest_path}")
+    print(f"Region turbidity plots saved to: {region_turbidity_dir}")
     return final_manifest_path
 
 def parse_args():
@@ -1184,11 +1212,11 @@ def main():
         final_manifest_path,
     )
 
-    # # Create summary visualization
-    # summary_path = create_region_turbidity_summary(
-    #     manifest_with_state,
-    #     liquid_out / "turbidity"
-    # )
+    # Create summary visualization
+    summary_path = create_region_turbidity_summary(
+        manifest_with_state,
+        liquid_out / "turbidity"
+    )
 
     # Clean up temporary manifest if created
     if is_temp and temp_manifest_path.exists():
