@@ -5,9 +5,9 @@ import cv2
 import numpy as np
 import torch
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+# matplotlib.use("Agg")
 
 # --- YOLOv5 internals ---
 from models.common import DetectMultiBackend
@@ -165,18 +165,22 @@ CAP_ID = 3
 LIQUID_CLASSES = {STABLE_ID, GEL_ID}
 
 # Heuristics
-PHASE_LAYER_MIN_GAP = 0.06   # min vertical gap between layer centers (normalized to crop height)
-IOU_MERGE_THR       = 0.50   # merge almost identical boxes
-STEP_THR            = 22.0   # vertical intensity step backup trigger
-GEL_AREA_FRAC_THR   = 0.35   # gel area fraction to classify as gelled; if gel area >=  of liquid area => gel
-CONF_MIN              = 0.20   # ignore boxes below this conf
-GEL_DOMINANCE_COUNT_THR = 1    # OR if (#gel boxes - #stable boxes) >= 1 => gel
-AIR_GAP_THR = 0.08  # % of crop height
+# PHASE_LAYER_MIN_GAP = 0.06   # min vertical gap between layer centers (normalized to crop height)
+# IOU_MERGE_THR       = 0.50   # merge almost identical boxes
+# STEP_THR            = 22.0   # vertical intensity step backup trigger
+# GEL_AREA_FRAC_THR   = 0.35   # gel area fraction to classify as gelled; if gel area >=% of liquid area => gel
+# CONF_MIN              = 0.20   # ignore boxes below this conf
+# GEL_DOMINANCE_COUNT_THR = 1    # OR if (#gel boxes - #stable boxes) >= 1 => gel
+# AIR_GAP_THR = 0.08  # % of crop height
 
 def is_liquid_cls(cid: int) -> bool:
     return cid in (GEL_ID, STABLE_ID)
 
 def yolo_line_to_xyxy(line, W, H):
+    """
+    Converts a YOLO format line into an (x1, y1, x2, y2) bounding box, confidence score
+    and class ID.
+    """
     # "cls cx cy w h [conf]"
     parts = line.strip().split()
     if len(parts) < 5:
@@ -189,10 +193,17 @@ def yolo_line_to_xyxy(line, W, H):
     return cls, [x1,y1,x2,y2], conf
 
 def box_area(b):
+    """
+    Calculates the area of a rectangular box given its coordinates.
+    """
     x1,y1,x2,y2 = b
     return max(0, x2-x1) * max(0, y2-y1)
 
 def iou_xyxy(a, b):
+    """
+    Calculates the Intersection over Union (IoU) for two rectangular bounding boxes
+    defined in XYXY format.
+    """
     ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
     ix2, iy2 = min(ax2, bx2), min(ay2, by2)
@@ -222,6 +233,9 @@ def merge_by_iou_desc_conf(dets, iou_thr=0.5):
 def detect_phase_separation_logic(detections, vial_height, vial_width, cap_bottom_y=None,
                                   conf_min=0.30, min_area_frac=0.002,
                                   iou_merge_thr=0.5, gap_thr=0.03, span_thr=0.20):
+    """
+    Determine whether a vial exhibits phase separation (multiple liquid layers) using detected liquid regions.
+    """
     # total vial area
     total_area = float(vial_height) * float(vial_width)
 
@@ -237,35 +251,51 @@ def detect_phase_separation_logic(detections, vial_height, vial_width, cap_botto
         if (d['area'] / max(1e-6, total_area)) < min_area_frac:
             continue
         liquid.append(d)
-    if len(liquid) < 2:
-        return False
 
-    # 1. merge duplicates
+    # merge duplicates
     liquid = merge_by_iou_desc_conf(liquid, iou_thr=iou_merge_thr)
-    if len(liquid) < 2:
-        return False
+    if len(liquid) >= 2:
+        return True, {
+            'decision_by': 'count'
+        }
 
-    # 2. sort once
-    liquid.sort(key=lambda x: x['center_y'])
+    # sort once by y-position (top to bottom)
+    detections.sort(key=lambda x: x['center_y'])
 
-    # 3. gap test
-    for i in range(len(liquid)-1):
-        current_bottom = liquid[i]['box'][3]
-        next_top       = liquid[i+1]['box'][1]
+    # gap test
+    gaps = []
+    for i in range( len(detections) - 1 ):
+        current_bottom = detections[i]['box'][3] # take y2 of top box
+        next_top       = detections[i+1]['box'][1] # take y1 of next box
         gap = (next_top - current_bottom) / float(vial_height)
+        gaps.append(gap)
         if gap >= gap_thr:
-            return True
+            return True, {
+                'gaps': gaps,
+                'max_gap': float(max((gap for gap in gaps), default=0.0)),
+                'decision_by': 'gap'
+            }
 
-    # 4. span test
-    span = (liquid[-1]['center_y'] - liquid[0]['center_y']) / float(vial_height)
-    return span >= span_thr
+    # span test
+    span = (liquid[-1]['center_y'] - liquid[0]['center_y']) / max(1e-6, float(vial_height))
+    if span >= span_thr:
+        return True, {
+            'span': span,
+            'decision_by': 'span'
+        }
 
-def enhanced_detect_phase_separation_from_turbidity(img, cap_bottom_y=None):
+    return False, {
+        'gaps': gaps,
+        'max_gap': float(max((gap for gap in gaps), default=0.0)),
+        'decision_by': 'no_decision'
+    }
+
+def detect_phase_separation_from_turbidity(img, cap_bottom_y=None):
     """
-    Detect phase separation with cap-aware region exclusion.
+    Detect phase separation from turbidity profile with cap-aware region exclusion.
     """
     try:
-        # Compute turbidity with intelligent exclusion
+        # Compute turbidity with exclusion
         v_raw, v_norm, excluded_info = compute_turbidity_profile_with_exclusion(
             img, cap_bottom_y
         )
@@ -561,12 +591,12 @@ def enhanced_decide(crop_path: Path, label_path: Path):
         return result
 
     # Check for phase separation
-    is_phase_separated = detect_phase_separation_logic(detections, H, W, cap_bottom_y)
+    is_phase_separated, phase_decision_metrics = detect_phase_separation_logic(detections, H, W, cap_bottom_y)
 
     if use_turbidity_decide:
         # turbidity analysis with cap exclusion
         if not is_phase_separated and img is not None:
-            is_phase_separated = enhanced_detect_phase_separation_from_turbidity(
+            is_phase_separated = detect_phase_separation_from_turbidity(
                 img, cap_bottom_y
             )
 
@@ -576,7 +606,8 @@ def enhanced_decide(crop_path: Path, label_path: Path):
             "n_gel": n_gel,
             "n_stable": n_stable,
             "gel_area_frac": gel_area / liquid_area if liquid_area > 0 else 0,
-            "phase_separation_metrics": analyze_phase_separation(detections, H)
+            "phase_separation_metrics": analyze_phase_separation(detections, H),
+            "phase_separation_decision_metrics": phase_decision_metrics,
         }
         if cap_info:
             result["cap_info"] = cap_info
@@ -700,7 +731,7 @@ def compute_turbidity_profile_with_exclusion(crop_bgr, cap_bottom_y=None,
                                              top_exclude_fraction=0.25,
                                              bottom_exclude_fraction=0.05):
     """
-    Compute turbidity profile with intelligent region exclusion.
+    Compute turbidity profile with region exclusion.
 
     Args:
         crop_bgr: BGR image of the crop
@@ -762,30 +793,32 @@ def compute_turbidity_profile_with_exclusion(crop_bgr, cap_bottom_y=None,
 
     return v_full, v_full_norm, excluded_info
 
-# def save_turbidity_plot(path, v_norm, dir=None):
-#     z = np.linspace(0, 1, len(v_norm))
-#     if dir is not None:
-#         filename = Path(path).stem + ".turbidity.png"
-#         out_path = dir / filename
-#     else:
-#         out_path = Path(path).with_suffix(".turbidity.png")
-#
-#     plt.figure(figsize=(3.0, 4.0), dpi=120)
-#     plt.plot(v_norm, z)
-#     plt.gca().invert_yaxis()
-#     plt.xlabel("Turbidity (norm)"); plt.ylabel("Normalized Height")
-#     plt.title(Path(path).name, fontsize=8)
-#     plt.tight_layout(); plt.savefig(out_path); plt.close()
-#     return str(out_path)
+def save_turbidity_plot(path, v_norm, dir=None, suffix=""):
+    """Save turbidity profile plot for a given normalized vector."""
+    z = np.linspace(0, 1, len(v_norm))
+    if dir is not None:
+        filename = Path(path).stem + f"{suffix}.turbidity.png"
+        out_path = Path(dir) / filename
+    else:
+        out_path = Path(path).with_name(Path(path).stem + f"{suffix}.turbidity.png")
 
-# def compute_turbidity_profile(crop_bgr):
-#     # Resize to (100, 500), HSV->V, mean over width
-#     crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-#     turb = cv2.resize(crop_rgb, (100, 500))
-#     hsv = cv2.cvtColor(turb, cv2.COLOR_RGB2HSV)
-#     v = np.mean(hsv[:, :, -1], axis=-1)  # (500,)
-#     v_norm = (v - v.min()) / max(1e-6, (v.max() - v.min()))
-#     return v, v_norm
+    plt.figure(figsize=(3.0, 4.0), dpi=120)
+    plt.plot(v_norm, z)
+    plt.gca().invert_yaxis()
+    plt.xlabel("Turbidity (norm)")
+    plt.ylabel("Normalized Height")
+    plt.title(Path(path).name + suffix, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    return str(out_path)
+
+def compute_turbidity_profile(crop):
+    """Compute row-wise normalized brightness (turbidity) for a crop."""
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    v = np.mean(gray, axis=1)               # mean brightness per row
+    v_norm = (v - v.min()) / (v.max() - v.min() + 1e-8)  # normalize 0–1
+    return v_norm
 
 def save_enhanced_turbidity_plot(path, v_norm, excluded_info, dir=None):
     z = np.linspace(0, 1, len(v_norm))
@@ -990,8 +1023,14 @@ def main():
     manifest_with_state = process_and_save_manifest(
         crop_records,
         liquid_out,
-        final_manifest_path
+        final_manifest_path,
     )
+
+    # # Create summary visualization
+    # summary_path = create_region_turbidity_summary(
+    #     manifest_with_state,
+    #     liquid_out / "turbidity"
+    # )
 
     # Clean up temporary manifest if created
     if is_temp and temp_manifest_path.exists():
@@ -1001,6 +1040,7 @@ def main():
     print(f"Crops:       {crops_dir}")
     print(f"Liquid out:  {liquid_out}")
     print(f"Final manifest: {manifest_with_state}")
+    print(f"Turbidity summary: {summary_path}")
 
 if __name__ == "__main__":
     main()
